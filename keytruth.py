@@ -5,6 +5,13 @@ import re
 import json
 import hashlib
 import argparse
+
+import sys
+USE_COLOR = (
+    sys.stdout.isatty()
+    and os.getenv("NO_COLOR") is None
+    and os.getenv("TERM") != "dumb"
+)
 import urllib.request
 import urllib.error
 import time
@@ -14,12 +21,17 @@ from pathlib import Path
 from dataclasses import dataclass, field, asdict
 
 
-GREEN = "[92m"
-YELLOW = "[93m"
-RED = "[91m"
-CYAN = "[96m"
-BOLD = "[1m"
-RESET = "[0m"
+GREEN = "\033[92m"
+YELLOW = "\033[93m"
+RED = "\033[91m"
+CYAN = "\033[96m"
+BOLD = "\033[1m"
+RESET = "\033[0m"
+
+def setup_colors(args):
+    global GREEN, YELLOW, RED, CYAN, BOLD, RESET
+    if getattr(args, 'no_color', False) or not USE_COLOR:
+        GREEN = YELLOW = RED = CYAN = BOLD = RESET = ""
 
 def color_status(value):
     base_val = value.split(":")[0]
@@ -774,7 +786,213 @@ def format_metric(status: ProbeResult) -> str:
     else:
         return str(status.metric_value)
 
-def print_table(results_cache, args=None, is_scan=False):
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+def visible_len(text):
+    return len(ANSI_RE.sub("", text))
+
+def fit(text, width):
+    plain = ANSI_RE.sub("", text)
+    if len(plain) <= width:
+        return text + " " * (width - len(plain))
+    return plain[:max(0, width - 1)] + "…"
+
+def panel_lines(title, lines, width) -> list[str]:
+    title_text = f" {title} "
+    top = f"╭─{title_text}{'─' * max(0, width - 3 - visible_len(title_text))}╮"
+    bottom = f"╰{'─' * max(0, width - 2)}╯"
+    out = [top]
+    for line in lines:
+        out.append(f"│ {fit(line, width - 4)} │")
+    out.append(bottom)
+    return out
+
+def join_panels(left, right, gap=2) -> list[str]:
+    out = []
+    max_len = max(len(left), len(right))
+    left_width = visible_len(left[0]) if left else 0
+    right_width = visible_len(right[0]) if right else 0
+    
+    for i in range(max_len):
+        l_line = left[i] if i < len(left) else " " * left_width
+        r_line = right[i] if i < len(right) else ""
+        out.append(f"{l_line}{' ' * gap}{r_line}")
+    return out
+
+def print_header_dashboard(known, candidates, non_candidates, critical_alerts, invalid_keys, probe_issues, providers, is_scan, term_width):
+    # For probe view header
+    width = term_width if term_width < 80 else 80
+    
+    w_count = 0
+    for d in known:
+        if d.get('_display_status') in ("Working", "Full", "Read", "Write") and not (d.get('_metric_str') in ("Placeholder", "Empty", "Malformed")):
+            w_count += 1
+            
+    c_prov = len(set(d['provider'] for d in candidates))
+    l1 = f"{len(candidates)} credentials    {len(non_candidates)} skipped    {c_prov} providers    local-only"
+    l2 = f"✓ {w_count} working      ! {len(probe_issues)} probe issues   ✕ {len(invalid_keys)} invalid      ! {len(critical_alerts)} critical"
+    
+    for line in panel_lines("KeyTruth v0.1.0", [l1, l2], width):
+        print(line)
+    print()
+
+def print_local_inventory_panel(files_count, known, candidates, non_candidates, critical_alerts, review_shared, term_width):
+    width = term_width if term_width < 80 else 80
+    c_prov = len(set(d['provider'] for d in candidates))
+    
+    lines = [
+        f"{files_count} .env files scanned",
+        f"{len(candidates)} credentials · {len(non_candidates)} skipped · {c_prov} providers",
+        f"{len(critical_alerts)} critical reuse risks · {len(review_shared)} shared credentials",
+        f"Cache: ~/.api_keys_cache.json · permissions 600"
+    ]
+    for line in panel_lines("LOCAL INVENTORY", lines, width):
+        print(line)
+    print()
+    print("Next: keytruth probe")
+
+def print_action_panel(critical_alerts, probe_issues, invalid_keys, review_shared, term_width):
+    width = term_width if term_width < 80 else 80
+    lines = []
+    
+    if critical_alerts:
+        for d in critical_alerts:
+            msg = d['status']['risk'].split(":", 1)[1].strip() if ":" in d['status']['risk'] else "Critical risk"
+            lines.append(f"{RED}!{RESET} {d['provider']:<10} {d['hash'][:8]}   {msg}")
+            
+    if probe_issues:
+        for d in probe_issues:
+            lines.append(f"{YELLOW}!{RESET} {d['provider']:<10} {d['hash'][:8]}   {d['_metric_compact']}")
+            
+    if invalid_keys:
+        inv_by_prov = {}
+        for d in invalid_keys:
+            inv_by_prov[d['provider']] = inv_by_prov.get(d['provider'], 0) + 1
+            
+        if lines:
+            lines.append("") # spacer
+            
+        inv_str = " · ".join(f"{p} {c}" for p, c in sorted(inv_by_prov.items(), key=lambda x: x[1], reverse=True))
+        lines.append(f"✕  {len(invalid_keys)} invalid keys: {inv_str}")
+        
+    if review_shared:
+        if lines:
+            lines.append("")
+        for d in review_shared:
+            msg = f"appears in {len(d['files'])} files" if d['_risk_label'] == "Shared" else d['status']['risk']
+            lines.append(f"{YELLOW}!{RESET} {d['provider']:<10} {d['hash'][:8]}   {msg}")
+            
+    if not lines:
+        lines = ["No action required"]
+        
+    for line in panel_lines("ACTION REQUIRED", lines, width):
+        print(line)
+    print()
+
+def print_metric_panels(known, term_width):
+    money_lines = []
+    access_lines = []
+    
+    for d in known:
+        if d.get('_metric_str') in ("Placeholder", "Empty", "Malformed"): continue
+        if d['_display_status'] == "Invalid": continue
+        
+        status = ProbeResult(**d['status'])
+        if status.metric_type in ("BALANCE", "ACCOUNT_BALANCE", "USAGE"):
+            money_lines.append(f"{d['provider']:<14} {d['_metric_compact']}")
+        elif status.metric_type == "IDENTITY" or status.access in ("Full", "Write", "Read"):
+            access_lines.append(f"{d['provider']:<14} {d['_metric_compact']}")
+            
+    if not money_lines and not access_lines:
+        return
+        
+    side_by_side = term_width >= 110
+    half_width = (term_width - 4) // 2 if side_by_side else (term_width if term_width < 80 else 80)
+    if half_width > 50: half_width = 50
+    
+    p_money = panel_lines("MONEY & QUOTA", money_lines if money_lines else ["No financial capabilities"], half_width)
+    p_access = panel_lines("ACCESS", access_lines if access_lines else ["No identity capabilities"], half_width)
+    
+    if side_by_side:
+        for line in join_panels(p_money, p_access):
+            print(line)
+        print()
+    else:
+        for line in p_money:
+            print(line)
+        print()
+        for line in p_access:
+            print(line)
+        print()
+
+def print_provider_panel(known, invalid_keys, probe_issues, term_width):
+    width = term_width if term_width < 80 else 80
+    providers = sorted(set(d['provider'] for d in known))
+    
+    prov_stats = {}
+    for d in known:
+        p = d['provider']
+        if p not in prov_stats:
+            prov_stats[p] = {'working': 0, 'issues': 0, 'metrics': [], 'critical': 0}
+        
+        if d['_display_status'] == "Invalid" or d['_risk_label'] == "Critical" or d in probe_issues:
+            prov_stats[p]['issues'] += 1
+            if d['_risk_label'] == "Critical":
+                prov_stats[p]['critical'] += 1
+            
+        if d['_display_status'] in ("Working", "Full", "Read", "Write"):
+            prov_stats[p]['working'] += 1
+            if d['_metric_compact'] not in ("Placeholder", "Empty", "Malformed"):
+                prov_stats[p]['metrics'].append(d['_metric_compact'])
+                
+    lines = []
+    for p in providers:
+        w = prov_stats[p]['working']
+        i = prov_stats[p]['issues']
+        c = prov_stats[p]['critical']
+        metrics = prov_stats[p]['metrics']
+        
+        unique = sorted(set(metrics))
+        
+        if c > 0:
+            m_str = f"{RED}{c} critical reuse alerts{RESET}"
+        elif not unique:
+            if any(d['provider'] == p and d['_display_status'] == "Invalid" for d in invalid_keys):
+                m_str = "Invalid/missing key"
+            else:
+                m_str = "No healthy keys"
+        elif len(unique) == 1:
+            m_str = unique[0]
+        else:
+            has_balance = any(
+                ProbeResult(**d['status']).metric_type in {"BALANCE", "ACCOUNT_BALANCE"} 
+                for d in known 
+                if d['provider'] == p and d['_display_status'] in {"Working", "Full", "Read", "Write"}
+            )
+            if has_balance:
+                m_str = f"{len(metrics)} balance-bearing keys"
+            else:
+                m_str = f"{len(metrics)} active keys"
+                
+        if w > 0 and i > 0:
+            bullet = f"{YELLOW}◐{RESET}"
+        elif w > 0:
+            bullet = f"{GREEN}●{RESET}"
+        elif i > 0:
+            bullet = f"{RED}○{RESET}"
+        else:
+            bullet = "○"
+            
+        lines.append(f"{bullet} {p:<12} {w} working   {i} issues      {m_str}")
+        
+    if not lines:
+        lines = ["No providers found"]
+        
+    for line in panel_lines("PROVIDERS", lines, width):
+        print(line)
+    print()
+
+def print_table(results_cache, args=None, is_scan=False, files_count=0):
     show_all = getattr(args, 'all', False) if args else False
     show_placeholders = getattr(args, 'placeholders', False) if args else False
     reused_only = getattr(args, 'reused', False) if args else False
@@ -783,16 +1001,12 @@ def print_table(results_cache, args=None, is_scan=False):
     if reused_only:
         known = [d for d in known if len(d['files']) > 1]
     
-    candidates = [d for d in known if format_metric(ProbeResult(**d['status'])) not in ("Placeholder", "Empty", "Malformed")]
-    non_candidates = [d for d in known if format_metric(ProbeResult(**d['status'])) in ("Placeholder", "Empty", "Malformed")]
+    candidates = [d for d in known if d.get('status', {}).get('metric_value') not in ("Placeholder", "Empty", "Malformed")]
+    non_candidates = [d for d in known if d.get('status', {}).get('metric_value') in ("Placeholder", "Empty", "Malformed")]
     
     term_width = shutil.get_terminal_size((80, 20)).columns
     is_narrow = term_width < 95
     
-    # Calculate provider counts
-    providers = set(d['provider'] for d in known)
-    
-    # Compute severities and format metrics
     critical_alerts = []
     probe_issues = []
     invalid_keys = []
@@ -816,7 +1030,6 @@ def print_table(results_cache, args=None, is_scan=False):
         data['_metric_compact'] = format_metric_compact(status)
         data['_display_status'] = display_status(status)
         
-        # Action required sorting logic
         is_placeholder = data['_metric_str'] in ("Placeholder", "Empty", "Malformed")
         if not is_placeholder:
             st = data['_display_status']
@@ -829,7 +1042,6 @@ def print_table(results_cache, args=None, is_scan=False):
             elif risk_label in ("Review", "Shared"):
                 review_shared.append(data)
 
-    # Sort detailed table correctly
     def sort_weight(data):
         st = data['_display_status']
         risk = data['_risk_label']
@@ -844,108 +1056,36 @@ def print_table(results_cache, args=None, is_scan=False):
         
     known.sort(key=sort_weight)
 
-    print(f"{GREEN}KeyTruth v0.1.0{RESET}")
-    c_providers = set(d['provider'] for d in candidates)
-    print(f"{len(candidates)} credentials • {len(non_candidates)} placeholders • {len(c_providers)} providers")
-    
-    if critical_alerts or invalid_keys or probe_issues or review_shared:
-        print(f"{len(critical_alerts)} critical • {len(probe_issues)} probe issues • {len(invalid_keys)} invalid • {len(review_shared)} shared")
-        
-    print(f"Privacy: local-only • no plaintext keys cached")
-    print()
-
     if not known:
+        print(f"{GREEN}KeyTruth v0.1.0{RESET}")
+        print("0 credentials • 0 placeholders • 0 providers")
+        print(f"Privacy: local-only • no plaintext keys cached\n")
         return
 
-    if not show_all and not is_scan:
-        # Action Required
-        if critical_alerts or probe_issues or invalid_keys or review_shared:
-            print(f"{CYAN}ACTION REQUIRED{RESET}")
+    if not show_all:
+        if is_scan:
+            print_local_inventory_panel(files_count, known, candidates, non_candidates, critical_alerts, review_shared, term_width)
+        else:
+            print_header_dashboard(known, candidates, non_candidates, critical_alerts, invalid_keys, probe_issues, set(d['provider'] for d in known), is_scan, term_width)
+            print_action_panel(critical_alerts, probe_issues, invalid_keys, review_shared, term_width)
+            print_metric_panels(known, term_width)
+            print_provider_panel(known, invalid_keys, probe_issues, term_width)
             
-            if critical_alerts:
-                print()
-                print("CRITICAL")
-                for d in critical_alerts:
-                    msg = d['status']['risk'].split(":", 1)[1].strip() if ":" in d['status']['risk'] else "Critical risk"
-                    print(f"  {d['provider']:<13} {d['hash'][:8]}  {msg}")
-            
-            if probe_issues:
-                print()
-                print("PROBE ISSUES")
-                for d in probe_issues:
-                    print(f"  {d['provider']:<13} {d['hash'][:8]}  {d['_metric_compact']}")
-                    
-            if invalid_keys:
-                print()
-                print("INVALID")
-                # Group by provider
-                inv_by_prov = {}
-                for d in invalid_keys:
-                    inv_by_prov[d['provider']] = inv_by_prov.get(d['provider'], 0) + 1
-                for p, count in sorted(inv_by_prov.items(), key=lambda x: x[1], reverse=True):
-                    s = "s" if count > 1 else ""
-                    print(f"  {p:<13} {count} key{s}")
-                    
-            if review_shared:
-                print()
-                print("REVIEW / SHARED")
-                for d in review_shared:
-                    msg = f"appears in {len(d['files'])} files" if d['_risk_label'] == "Shared" else d['status']['risk']
-                    print(f"  {d['provider']:<13} {d['hash'][:8]}  {msg}")
-            print()
-            
-        # Provider Overview
-        print(f"{CYAN}PROVIDERS{RESET}")
-        print("PROVIDER      WORKING  ISSUES  METRIC")
-        
-        prov_stats = {}
-        for d in known:
-            p = d['provider']
-            if p not in prov_stats:
-                prov_stats[p] = {'working': 0, 'issues': 0, 'metrics': []}
-            
-            if d['_display_status'] == "Invalid" or d['_risk_label'] == "Critical" or d in probe_issues:
-                prov_stats[p]['issues'] += 1
-                
-            if d['_display_status'] in ("Working", "Full", "Read", "Write"):
-                prov_stats[p]['working'] += 1
-                if d['_metric_compact'] not in ("Placeholder", "Empty", "Malformed"):
-                    prov_stats[p]['metrics'].append(d['_metric_compact'])
-                    
-        for p in sorted(providers):
-            w = prov_stats[p]['working']
-            i = prov_stats[p]['issues']
-            metrics = prov_stats[p]['metrics']
-            
-            unique = sorted(set(metrics))
-            
-            if not unique:
-                if any(d['provider'] == p and d['_display_status'] == "Invalid" for d in invalid_keys):
-                    m_str = "Invalid/missing key"
-                else:
-                    m_str = "No healthy keys"
-            elif len(unique) == 1:
-                m_str = unique[0]
-            else:
-                has_balance = any(
-                    ProbeResult(**d['status']).metric_type in {"BALANCE", "ACCOUNT_BALANCE"} 
-                    for d in known 
-                    if d['provider'] == p and d['_display_status'] in {"Working", "Full", "Read", "Write"}
-                )
-                if has_balance:
-                    m_str = f"{len(metrics)} balance-bearing keys"
-                else:
-                    m_str = f"{len(metrics)} active keys"
-                
-            print(f"{p:<13} {w:<8} {i:<7} {m_str}")
-        print()
-
+            print(f"Details: keytruth probe --all")
+            print(f"Reuse:   keytruth probe --reused")
     else:
         # Detailed UI view
         to_show = known
         if not show_placeholders:
             to_show = [d for d in known if d['_metric_str'] not in ("Placeholder", "Empty", "Malformed")]
             
+        print(f"{GREEN}KeyTruth v0.1.0{RESET}")
+        c_providers = set(d['provider'] for d in candidates)
+        print(f"{len(candidates)} credentials • {len(non_candidates)} placeholders • {len(c_providers)} providers")
+        if critical_alerts or invalid_keys or probe_issues or review_shared:
+            print(f"{len(critical_alerts)} critical • {len(probe_issues)} probe issues • {len(invalid_keys)} invalid • {len(review_shared)} shared")
+        print(f"Privacy: local-only • no plaintext keys cached\n")
+
         if is_narrow:
             for data in to_show:
                 risk_label = data['_risk_label']
@@ -985,7 +1125,7 @@ def print_table(results_cache, args=None, is_scan=False):
                 print(f"│ {data['hash'][:8]:<8} │ {data['provider']:<12} │ {c_status}{' '*pad_status} │ {metric_str:<36} │ {c_risk}{' '*pad_risk} │")
             print("└──────────┴──────────────┴────────────┴──────────────────────────────────────┴──────────┘")
 
-        # Reuse Alerts are shown at bottom of table
+        # Reuse Alerts are shown at bottom of table for scan
         if (critical_alerts or review_shared) and is_scan:
             alerts = [(d['_risk_label'], d['provider'], d['hash'][:8], d['status']['risk'] if 'risk' in d['status'] and ":" in d['status']['risk'] else "") for d in critical_alerts + review_shared]
             print()
@@ -1036,7 +1176,8 @@ def main():
     scan_parser.add_argument('--unknown', action='store_true', help="Output unknown variable names that look like secrets")
     scan_parser.add_argument('--group-by-variable', action='store_true', help="Summarize unknown variables")
     scan_parser.add_argument('--reused', action='store_true', help="Only show credentials reused across multiple files")
-    scan_parser.add_argument('--verbose', action='store_true', help="Show verbose local scanning logs")
+    scan_parser.add_argument('--all', action='store_true', help="Show the complete detailed credential table")
+    scan_parser.add_argument('--no-color', action='store_true', help="Disable ANSI color output")
     
     probe_parser = subparsers.add_parser('probe', help="Probe discovered keys against provider networks")
     probe_parser.add_argument('paths', nargs='*', help="Paths to scan and probe (default: uses last scanned paths from cache)")
@@ -1046,8 +1187,10 @@ def main():
     probe_parser.add_argument('--all', action='store_true', help="Show the complete detailed credential table")
     probe_parser.add_argument('--placeholders', action='store_true', help="Include placeholders in the detailed table (implies --all)")
     probe_parser.add_argument('--reused', action='store_true', help="Only show credentials reused across multiple files")
+    probe_parser.add_argument('--no-color', action='store_true', help="Disable ANSI color output")
     
     args = parser.parse_args()
+    setup_colors(args)
 
     if getattr(args, 'placeholders', False):
         args.all = True
@@ -1059,7 +1202,7 @@ def main():
 
 def run_scan(args):
     print(f"Scanning {', '.join(args.paths)} for .env files (local only)...")
-    files = find_env_files(args.paths, verbose=args.verbose)
+    files = find_env_files(args.paths, verbose=False)
     print(f"Found {len(files)} .env files. Extracting and classifying keys...")
     
     inventory = extract_keys(files, capture_unknown=args.unknown)
@@ -1068,7 +1211,12 @@ def run_scan(args):
     for key_hash, data in inventory.items():
         provider = data['provider']
         
-        status = ProbeResult(provider=provider, metric_value="Pending Probe" if provider != "UNKNOWN" else "Unknown Provider")
+        category = classify_key(data['key'])
+        
+        if category != "Candidate":
+            status = ProbeResult(provider=provider, metric_value=category, auth="Not tested", access="None")
+        else:
+            status = ProbeResult(provider=provider, metric_value="Unprobed" if provider != "UNKNOWN" else "Unknown Provider")
         
         results_cache.append({
             'provider': provider,
@@ -1091,7 +1239,7 @@ def run_scan(args):
     
     write_cache(cache_payload)
     print(f"\nLocal inventory saved securely to {CACHE_FILE}")
-    print_table(results_cache, args=args, is_scan=True)
+    print_table(results_cache, args=args, is_scan=True, files_count=len(files))
     if args.unknown:
         if args.group_by_variable:
             print_discovery_report(results_cache)
