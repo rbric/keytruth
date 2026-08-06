@@ -1,0 +1,50 @@
+# KeyTruth
+
+**A local-only CLI that discovers API credentials, proves which ones still work, identifies dangerous reuse, and never uploads or stores the secrets.**
+
+## The Privacy Guarantee
+KeyTruth is built strictly as a credential truth machine. We believe you should never have to hand over your secrets to discover their state.
+
+* **No telemetry.** We track nothing.
+* **No remote server.** This is a local CLI.
+* **No plaintext credentials written to disk.** The internal state cache only holds key fingerprints and masked identities.
+* **No financial data cached.** Sensitive data (like Stripe balances) vanishes the moment the script exits.
+* **Direct connections only.** All provider network requests go directly from your machine to the provider's official APIs.
+
+## Installation
+
+```bash
+pip install keytruth
+```
+
+## Usage
+
+KeyTruth splits discovery and network requests into two explicit steps.
+
+### 1. Local Scan
+
+Scan your current directory (or any path) for `.env` files to build a local inventory. This phase **never makes network requests**.
+
+```bash
+keytruth scan .
+```
+You can also run:
+```bash
+keytruth scan . --unknown --group-by-variable
+```
+This will report any plausible API secrets it didn't recognize, helping you find forgotten keys.
+
+### 2. Network Probe
+
+To test whether the discovered keys actually work, run a network probe. This phase temporarily reads the files again, performs direct requests to the providers, and updates the inventory state.
+
+```bash
+keytruth probe
+```
+
+To probe sensitive financial credentials (like Stripe):
+```bash
+keytruth probe --financial
+```
+
+*Note: The OpenAI `credit_grants` session endpoint is undocumented and can be fragile. To enable it, run `keytruth probe --experimental`.*

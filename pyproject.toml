@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "keytruth"
+version = "0.1.0"
+description = "A local-only CLI that discovers API credentials, proves which ones still work, identifies dangerous reuse, and never uploads or stores the secrets."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT License" }
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+keytruth = "keytruth:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

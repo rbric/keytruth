@@ -100,32 +100,32 @@ def make_request(url, method="GET", headers=None, data=None):
         latency = int((time.time() - start_t) * 1000)
         return 0, str(e), latency
 
-def probe_openai(key, is_financial=False):
-    status = ProbeResult(provider="OPENAI", category="AI Compute", checked_at=datetime.datetime.now().isoformat())
+def probe_openai(key, is_financial=False, is_experimental=False):
+    status = ProbeResult(provider="OPENAI", metric_value="Valid Format")
+    
     headers = {"Authorization": f"Bearer {key}"}
-    
-    code, body, lat = make_request("https://api.openai.com/v1/dashboard/billing/credit_grants", headers=headers)
-    log_debug(status, f"[credit_grants] {code} {lat}ms: {body[:200]}")
-    status.http_status = code
-    
-    if code == 200:
-        try:
-            data = json.loads(body)
-            status.auth = "Valid"
-            status.metric_type = "BALANCE"
-            status.metric_value = float(data.get('total_available', 0))
-            status.metric_unit = "USD"
-            status.funding = "Funded" if status.metric_value > 0 else "Depleted"
-        except Exception:
-            pass
-    elif code == 401:
-        if "invalid_api_key" in body or "Incorrect API key" in body or "must be made with a session key" not in body:
-            status.auth = "Invalid"
-            status.access = "None"
-            status.metric_type = "NONE"
-            status.metric_value = "Invalid Key"
-            return status
-            
+    if is_experimental:
+        code, body, lat = make_request("https://api.openai.com/v1/dashboard/billing/credit_grants", headers=headers)
+        log_debug(status, f"[/v1/dashboard/billing/credit_grants] {code} {lat}ms: {body[:200]}")
+        
+        if code == 200:
+            try:
+                data = json.loads(body)
+                status.auth = "Valid"
+                status.metric_type = "BALANCE"
+                status.metric_value = float(data.get('total_available', 0))
+                status.metric_unit = "USD"
+                status.funding = "Funded" if status.metric_value > 0 else "Depleted"
+            except Exception:
+                pass
+        elif code == 401:
+            if "invalid_api_key" in body or "Incorrect API key" in body or "must be made with a session key" not in body:
+                status.auth = "Invalid"
+                status.access = "None"
+                status.metric_type = "NONE"
+                status.metric_value = "Invalid Key"
+                return status
+                
     if status.auth == "Unknown":
         code, body, lat = make_request("https://api.openai.com/v1/models", headers=headers)
         log_debug(status, f"[/v1/models] {code} {lat}ms: {body[:200]}")
@@ -579,20 +579,35 @@ def classify_assignment(name, value):
         
     return "IGNORE", is_ph
 
-def find_env_files():
-    base_dir = str(Path.home())
+def find_env_files(scan_paths, verbose=False):
     exclude_dirs = {'node_modules', '.git', 'Library', 'Applications', 'Downloads', 'Pictures', 'Music', 'Movies', '.venv', 'venv'}
     files = []
     
-    for root, dirs, filenames in os.walk(base_dir):
-        dirs[:] = [d for d in dirs if d not in exclude_dirs and not d.startswith('.Trash')]
-        if root[len(base_dir):].count(os.sep) > 4:
-            dirs[:] = []
+    for base_path in scan_paths:
+        base_dir = Path(base_path).resolve()
+        if not base_dir.is_dir():
+            if base_dir.is_file() and '.env' in base_dir.name:
+                files.append(str(base_dir))
             continue
-        for name in filenames:
-            if '.env' in name:
-                files.append(os.path.join(root, name))
-    return files
+            
+        for root, dirs, filenames in os.walk(base_dir):
+            dirs[:] = [d for d in dirs if d not in exclude_dirs and not d.startswith('.Trash')]
+            # strict dir skipping for symlinks
+            dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d))]
+            
+            for name in filenames:
+                if '.env' in name:
+                    full_path = os.path.join(root, name)
+                    if os.path.islink(full_path):
+                        continue
+                    try:
+                        if os.path.getsize(full_path) > 1024 * 1024:
+                            if verbose: print(f"Skipping {full_path} (too large)")
+                            continue
+                        files.append(full_path)
+                    except OSError as e:
+                        if verbose: print(f"Cannot read {full_path}: {e}")
+    return list(set(files))
 
 def extract_keys(files, capture_unknown=False):
     found_keys = {}
@@ -760,46 +775,106 @@ def print_debug(results_cache):
     print("\n")
 
 def main():
-    parser = argparse.ArgumentParser(description="Credential Truth Machine: Inventory and evaluate API keys.")
-    parser.add_argument('--refresh', action='store_true', help="Bypass cache and force network/disk scan")
-    parser.add_argument('--debug', action='store_true', help="Print complete network trace and classification logs")
-    parser.add_argument('--unknown', action='store_true', help="Output unknown variable names that look like secrets")
-    parser.add_argument('--group-by-variable', action='store_true', help="Summarize unknown variables")
-    parser.add_argument('--financial', action='store_true', help="Opt-in to querying sensitive financial credentials like Stripe")
-    parser.add_argument('--reused', action='store_true', help="Only show credentials reused across multiple files")
+    parser = argparse.ArgumentParser(description="KeyTruth: Discover and evaluate API credentials.")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    
+    scan_parser = subparsers.add_parser('scan', help="Scan directories for API keys locally (no network requests)")
+    scan_parser.add_argument('paths', nargs='*', default=['.'], help="Paths to scan (default: current directory)")
+    scan_parser.add_argument('--unknown', action='store_true', help="Output unknown variable names that look like secrets")
+    scan_parser.add_argument('--group-by-variable', action='store_true', help="Summarize unknown variables")
+    scan_parser.add_argument('--reused', action='store_true', help="Only show credentials reused across multiple files")
+    scan_parser.add_argument('--verbose', action='store_true', help="Show verbose local scanning logs")
+    
+    probe_parser = subparsers.add_parser('probe', help="Probe discovered keys against provider networks")
+    probe_parser.add_argument('paths', nargs='*', help="Paths to scan and probe (default: uses last scanned paths from cache)")
+    probe_parser.add_argument('--financial', action='store_true', help="Opt-in to querying sensitive financial credentials like Stripe")
+    probe_parser.add_argument('--experimental', action='store_true', help="Enable undocumented/fragile endpoints (like OpenAI credit_grants)")
+    probe_parser.add_argument('--debug', action='store_true', help="Print complete network trace and classification logs")
+    
     args = parser.parse_args()
 
-    if not args.refresh and CACHE_FILE.exists():
-        try:
-            with open(CACHE_FILE, 'r') as f:
-                cache_data = json.load(f)
-                
-            if cache_data.get("schema_version") != 2:
-                print("Cache format changed (schema v2 required); run `keys --refresh` to upgrade.")
-                return
-                
-            results_cache = cache_data.get("credentials", [])
-            
-            if args.debug:
-                print_debug(results_cache)
-            print_table(results_cache, reused_only=args.reused)
-            if args.unknown:
-                if args.group_by_variable:
-                    print_discovery_report(results_cache)
-                else:
-                    print_unknowns(results_cache)
-            return
-        except Exception:
-            print("Cache format invalid; run `keys --refresh` to rebuild.")
-            return
+    if args.command == 'scan':
+        run_scan(args)
+    elif args.command == 'probe':
+        run_probe(args)
 
-    if not args.debug:
-        print("Scanning for .env files...")
-    files = find_env_files()
-    if not args.debug:
-        print(f"Found {len(files)} .env files. Extracting and classifying keys...")
+def run_scan(args):
+    print(f"Scanning {', '.join(args.paths)} for .env files (local only)...")
+    files = find_env_files(args.paths, verbose=args.verbose)
+    print(f"Found {len(files)} .env files. Extracting and classifying keys...")
     
     inventory = extract_keys(files, capture_unknown=args.unknown)
+    results_cache = []
+    
+    for key_hash, data in inventory.items():
+        provider = data['provider']
+        
+        status = ProbeResult(provider=provider, metric_value="Pending Probe" if provider != "UNKNOWN" else "Unknown Provider")
+        
+        results_cache.append({
+            'provider': provider,
+            'var_name': data['var_name'],
+            'masked_key': data['masked'],
+            'hash': key_hash,
+            'status': asdict(status),
+            'files': data['files']
+        })
+        
+    cache_payload = {
+        "schema_version": 3,
+        "scan": {
+            "roots": [str(Path(p).resolve()) for p in args.paths],
+            "scanned_at": datetime.datetime.now().isoformat(),
+            "inventory": results_cache
+        },
+        "probe": {}
+    }
+    
+    write_cache(cache_payload)
+    print(f"\\nLocal inventory saved securely to {CACHE_FILE}")
+    print_table(results_cache, reused_only=args.reused)
+    if args.unknown:
+        if args.group_by_variable:
+            print_discovery_report(results_cache)
+        else:
+            print_unknowns(results_cache)
+
+def write_cache(cache_payload):
+    CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", dir=CACHE_FILE.parent, delete=False, encoding="utf-8") as tmp:
+        json.dump(cache_payload, tmp, indent=2)
+        tmp_path = Path(tmp.name)
+        
+    os.chmod(tmp_path, 0o600)
+    os.replace(tmp_path, CACHE_FILE)
+
+def run_probe(args):
+    if not CACHE_FILE.exists():
+        print("No cache found. Run `keytruth scan .` first.")
+        return
+        
+    try:
+        with open(CACHE_FILE, 'r') as f:
+            cache_data = json.load(f)
+    except Exception:
+        print("Cache format invalid. Run `keytruth scan .` again.")
+        return
+        
+    if cache_data.get("schema_version") != 3:
+        print("Cache format changed (schema v3 required). Run `keytruth scan .` first.")
+        return
+        
+    scan_data = cache_data.get("scan", {})
+    roots = args.paths if args.paths else scan_data.get("roots", ["."])
+    
+    if not args.debug:
+        print(f"Rescanning {', '.join(roots)} to find raw keys...")
+    files = find_env_files(roots, verbose=False)
+    inventory = extract_keys(files, capture_unknown=False)
+    
+    if not args.debug:
+        print("Probing networks...")
+        
     results_cache = []
     
     for key_hash, data in inventory.items():
@@ -807,16 +882,6 @@ def main():
         raw_key = data['key']
         
         if provider == "UNKNOWN":
-            status = ProbeResult(provider="UNKNOWN", metric_value="Unknown Provider")
-            results_cache.append({
-                'provider': provider,
-                'var_name': data['var_name'],
-                'masked_key': data['masked'],
-                'hash': key_hash,
-                'status': asdict(status),
-                'key': raw_key,
-                'files': data['files']
-            })
             continue
             
         category = classify_key(raw_key)
@@ -825,7 +890,10 @@ def main():
         else:
             prober = PROBERS.get(provider)
             if prober:
-                status = prober(raw_key, is_financial=args.financial)
+                if provider == 'OPENAI':
+                    status = prober(raw_key, is_financial=args.financial, is_experimental=args.experimental)
+                else:
+                    status = prober(raw_key, is_financial=args.financial)
             else:
                 status = ProbeResult(provider=provider, metric_value="No Prober")
             
@@ -834,64 +902,46 @@ def main():
             'masked_key': data['masked'],
             'hash': key_hash,
             'status': asdict(status),
-            'key': raw_key,
             'files': data['files']
         })
         
     # Check for live Stripe key reuse
     stripe_live_keys = {}
     for d in results_cache:
-        if d['provider'] == 'STRIPE' and d['key'].startswith('sk_live_'):
+        if d['provider'] == 'STRIPE' and d['masked_key'].startswith('sk_live_'):
             k_hash = d['hash']
             stripe_live_keys[k_hash] = len(d['files'])
             
     for d in results_cache:
-        if d['provider'] == 'STRIPE' and d['key'].startswith('sk_live_'):
+        if d['provider'] == 'STRIPE' and d['masked_key'].startswith('sk_live_'):
             if stripe_live_keys[d['hash']] > 1:
                 d['status']['risk'] = "Critical: Live key reuse across projects"
 
     if args.debug:
         print_debug(results_cache)
         
-    print_table(results_cache, reused_only=args.reused)
-    if args.unknown:
-        if args.group_by_variable:
-            print_discovery_report(results_cache)
-        else:
-            print_unknowns(results_cache)
-        
+    print_table(results_cache, reused_only=False)
+    
     cache_to_save = []
     for rc in results_cache:
         safe_rc = dict(rc)
-        safe_rc.pop('key', None) # DO NOT save the raw key!
-        
         safe_status = dict(rc['status'])
         safe_status['debug_logs'] = []
         if rc['provider'] == 'STRIPE':
             safe_status['metric_type'] = "NONE"
-            is_live = rc.get('key', '').startswith('sk_live_')
+            is_live = rc.get('masked_key', '').startswith('sk_live_')
             safe_status['metric_value'] = "Live key — opt-in required" if is_live else "Test key"
             safe_status['metric_limit'] = None
             
         safe_rc['status'] = safe_status
         cache_to_save.append(safe_rc)
         
-    cache_payload = {
-        "schema_version": 2,
-        "generated_at": datetime.datetime.now().isoformat(),
-        "credentials": cache_to_save
+    cache_data['probe'] = {
+        "probed_at": datetime.datetime.now().isoformat(),
+        "results": cache_to_save
     }
-
-    CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(mode="w", dir=CACHE_FILE.parent, delete=False, encoding="utf-8") as tmp:
-        json.dump(cache_payload, tmp, indent=2)
-        tmp_path = Path(tmp.name)
-        
-    os.chmod(tmp_path, 0o600)
-    os.replace(tmp_path, CACHE_FILE)
     
-    if not args.debug:
-        print(f"\nInventory saved securely to {CACHE_FILE}")
+    write_cache(cache_data)
 
 if __name__ == "__main__":
     main()
