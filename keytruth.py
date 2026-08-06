@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import shutil
 import re
 import json
 import hashlib
@@ -11,6 +12,28 @@ import tempfile
 import datetime
 from pathlib import Path
 from dataclasses import dataclass, field, asdict
+
+
+GREEN = "[92m"
+YELLOW = "[93m"
+RED = "[91m"
+CYAN = "[96m"
+BOLD = "[1m"
+RESET = "[0m"
+
+def color_status(value):
+    base_val = value.split(":")[0]
+    color = {
+        "Valid": GREEN,
+        "Working": GREEN,
+        "Funded": GREEN,
+        "Normal": GREEN,
+        "Unknown": YELLOW,
+        "Shared": YELLOW,
+        "Review": YELLOW,
+        "Critical": RED,
+    }.get(base_val, "")
+    return f"{color}{value}{RESET}"
 
 CACHE_FILE = Path.home() / ".api_keys_cache.json"
 SECRET_WORDS = ("API_KEY", "TOKEN", "SECRET", "ACCESS_KEY", "AUTH_KEY", "CREDENTIAL")
@@ -708,35 +731,82 @@ def print_table(results_cache, reused_only=False):
     candidates = [d for d in known if format_metric(ProbeResult(**d['status'])) not in ("Placeholder", "Empty", "Malformed")]
     non_candidates = [d for d in known if format_metric(ProbeResult(**d['status'])) in ("Placeholder", "Empty", "Malformed")]
     
-    if reused_only:
-        print(f"\n{len(known)} reused credential assignments found for known providers")
-    else:
-        print(f"\n{len(known)} credential assignments found for known providers")
-    print(f"{len(candidates)} plausible credentials")
-    print(f"{len(non_candidates)} placeholders or malformed values\n")
+    term_width = shutil.get_terminal_size((80, 20)).columns
+    is_narrow = term_width < 95
+    
+    print(f"{GREEN}KeyTruth v0.1.0{RESET}")
+    print(f"Credentials: {len(known)} found • {len(candidates)} plausible • {len(non_candidates)} placeholders")
+    print(f"Privacy: local-only • no plaintext keys cached")
+    print()
 
-    if known:
-        print(f"{'PROVIDER':<12} | {'CATEGORY':<12} | {'AUTH':<10} | {'ACCESS':<12} | {'METRIC':<40} | {'RISK'}")
-        print("-" * 115)
+    if not known:
+        return
+
+    # Process risks and alerts
+    alerts = []
+    for data in known:
+        status = ProbeResult(**data['status'])
+        raw_risk = status.risk
+        if raw_risk == "Low":
+            risk_label = "Normal"
+        elif ":" in raw_risk:
+            risk_label = raw_risk.split(":")[0]
+            alerts.append((risk_label, data['provider'], data['hash'][:8], raw_risk.split(":", 1)[1].strip()))
+        elif len(data['files']) > 1:
+            risk_label = "Shared"
+            alerts.append((risk_label, data['provider'], data['hash'][:8], f"appears in {len(data['files'])} files"))
+        else:
+            risk_label = "Normal"
+            
+        data['_risk_label'] = risk_label
+        data['_metric_str'] = format_metric(status)
+
+    if is_narrow:
         for data in known:
             status = ProbeResult(**data['status'])
-            metric_str = format_metric(status)
-            print(f"{data['provider']:<12} | {status.category:<12} | {status.auth:<10} | {status.access:<12} | {metric_str:<40} | {status.risk}")
+            risk_label = data['_risk_label']
+            print(f"{CYAN}⚠ {data['provider']} {data['hash'][:8]}{RESET}")
+            print(f"  Auth:   {color_status(status.auth)}")
+            print(f"  Access: {color_status(status.access)}")
+            print(f"  Metric: {data['_metric_str']}")
+            print(f"  Risk:   {color_status(risk_label)}")
+            print()
+    else:
+        print("┌──────────┬──────────────┬────────────┬────────────┬──────────────────────────────────────┬──────────┐")
+        print("│ KEY ID   │ PROVIDER     │ AUTH       │ ACCESS     │ METRIC                               │ RISK     │")
+        print("├──────────┼──────────────┼────────────┼────────────┼──────────────────────────────────────┼──────────┤")
+        for data in known:
+            status = ProbeResult(**data['status'])
+            risk_label = data['_risk_label']
+            metric_str = data['_metric_str']
+            # truncate metric if too long
+            if len(metric_str) > 36:
+                metric_str = metric_str[:33] + "..."
+                
+            c_auth = color_status(status.auth)
+            c_acc = color_status(status.access)
+            c_risk = color_status(risk_label)
+            
+            # calculate visible padding
+            pad_auth = 10 - len(status.auth)
+            pad_acc = 10 - len(status.access)
+            pad_risk = 8 - len(risk_label)
+            
+            print(f"│ {data['hash'][:8]:<8} │ {data['provider']:<12} │ {c_auth}{' '*pad_auth} │ {c_acc}{' '*pad_acc} │ {metric_str:<36} │ {c_risk}{' '*pad_risk} │")
+        print("└──────────┴──────────────┴────────────┴────────────┴──────────────────────────────────────┴──────────┘")
 
-def print_unknowns(results_cache):
-    unknowns = [d for d in results_cache if d['provider'] == 'UNKNOWN']
-    if unknowns:
-        print(f"\n{len(unknowns)} UNKNOWN secret assignments found:")
-        print(f"{'PROVIDER':<11} | {'VAR NAME':<25} | {'MASKED KEY':<18} | {'PATHS'}")
-        print("-" * 110)
-        for d in unknowns:
-            paths = ", ".join([p.replace(str(Path.home()), "~") for p in d['files']])
-            print(f"{d['provider']:<11} | {d['var_name']:<25} | {d['masked_key']:<18} | {paths}")
+    if alerts:
+        print()
+        print(f"{CYAN}Reuse Alerts{RESET}")
+        for r_label, prov, k_id, msg in alerts:
+            color = RED if r_label == "Critical" else YELLOW
+            print(f"{color}●{RESET} {prov} key {k_id} {msg} ({color_status(r_label)})")
 
 def print_discovery_report(results_cache):
     unknowns = [d for d in results_cache if d['provider'] == 'UNKNOWN']
     if not unknowns:
-        print("\nNo UNKNOWN assignments found.")
+        print()
+        print("No UNKNOWN assignments found.")
         return
         
     summary = {}
@@ -747,32 +817,21 @@ def print_discovery_report(results_cache):
         summary[var_name]['assignments'] += 1
         summary[var_name]['files'].update(d['files'])
         
-    print(f"\n{len(unknowns)} UNKNOWN assignments found (Discovery Report):")
-    print(f"{'VARIABLE':<25} | {'VALUES':<6} | {'FILES':<5} | {'RECOMMENDATION'}")
-    print("-" * 80)
-    for var, stats in sorted(summary.items(), key=lambda x: x[1]['assignments'], reverse=True):
-        rec = UNKNOWN_RECOMMENDATIONS.get(var, "Inventory only — inspect manually")
-        print(f"{var:<25} | {stats['assignments']:<6} | {len(stats['files']):<5} | {rec}")
+    print()
+    print(f"{CYAN}Unknown Discovery Report{RESET}")
+    print("┌───────────────────────────┬────────┬────────┬──────────────────┐")
+    print("│ VARIABLE                  │ VALUES │ FILES  │ RECOMMENDATION   │")
+    print("├───────────────────────────┼────────┼────────┼──────────────────┤")
+    for var_name, stats in sorted(summary.items(), key=lambda x: x[1]['assignments'], reverse=True):
+        vals = stats['assignments']
+        files = len(stats['files'])
+        rec = "Inventory only" if files > 2 else "Inspect manually"
+        vname = var_name[:25]
+        print(f"│ {vname:<25} │ {vals:<6} │ {files:<6} │ {rec:<16} │")
+    print("└───────────────────────────┴────────┴────────┴──────────────────┘")
 
-def print_debug(results_cache):
-    print("\n" + "="*80)
-    print("DEBUG TRACE")
-    print("="*80)
-    for data in results_cache:
-        print(f"\nProvider: {data['provider']}")
-        print(f"Key ID:   {data['hash'][:8]}")
-        print(f"Masked:   {data['masked_key']}")
-        print(f"Files:    {', '.join(data['files'])}")
-        if data['provider'] == 'UNKNOWN':
-            print("Outcome:  Not probed")
-            continue
-        status = ProbeResult(**data['status'])
-        print(f"Outcome:  Auth={status.auth}, Funding={status.funding}, Access={status.access}, Metric={format_metric(status)}")
-        if status.debug_logs:
-            print("Probes:")
-            for log in status.debug_logs:
-                print(f"  -> {log}")
-    print("\n")
+def print_unknowns(results_cache):
+    print_discovery_report(results_cache)
 
 def main():
     parser = argparse.ArgumentParser(description="KeyTruth: Discover and evaluate API credentials.")
@@ -831,7 +890,7 @@ def run_scan(args):
     }
     
     write_cache(cache_payload)
-    print(f"\\nLocal inventory saved securely to {CACHE_FILE}")
+    print(f"\nLocal inventory saved securely to {CACHE_FILE}")
     print_table(results_cache, reused_only=args.reused)
     if args.unknown:
         if args.group_by_variable:
