@@ -845,10 +845,11 @@ def print_table(results_cache, args=None, is_scan=False):
     known.sort(key=sort_weight)
 
     print(f"{GREEN}KeyTruth v0.1.0{RESET}")
-    print(f"{len(known)} credentials • {len(non_candidates)} placeholders • {len(providers)} providers")
+    c_providers = set(d['provider'] for d in candidates)
+    print(f"{len(candidates)} credentials • {len(non_candidates)} placeholders • {len(c_providers)} providers")
     
     if critical_alerts or invalid_keys or probe_issues or review_shared:
-        print(f"{len(critical_alerts)} critical • {len(invalid_keys)} invalid • {len(probe_issues)} restricted • {len(review_shared)} shared")
+        print(f"{len(critical_alerts)} critical • {len(probe_issues)} probe issues • {len(invalid_keys)} invalid • {len(review_shared)} shared")
         
     print(f"Privacy: local-only • no plaintext keys cached")
     print()
@@ -906,7 +907,7 @@ def print_table(results_cache, args=None, is_scan=False):
             if d['_display_status'] == "Invalid" or d['_risk_label'] == "Critical" or d in probe_issues:
                 prov_stats[p]['issues'] += 1
                 
-            if d['_display_status'] in ("Working", "Full", "Read", "Write", "Valid", "Rate limited"):
+            if d['_display_status'] in ("Working", "Full", "Read", "Write"):
                 prov_stats[p]['working'] += 1
                 if d['_metric_compact'] not in ("Placeholder", "Empty", "Malformed"):
                     prov_stats[p]['metrics'].append(d['_metric_compact'])
@@ -916,27 +917,25 @@ def print_table(results_cache, args=None, is_scan=False):
             i = prov_stats[p]['issues']
             metrics = prov_stats[p]['metrics']
             
-            m_str = metrics[0] if metrics else "No data"
+            unique = sorted(set(metrics))
             
-            # Aggregate if units match
-            if p == "OPENAI" and all("No balance authority" == m for m in metrics):
-                m_str = "No balance authority"
-            elif p == "ANTHROPIC" and all("No balance endpoint" == m for m in metrics):
-                m_str = "No balance endpoint"
-            elif p == "FAL" and all("No billing authority" == m for m in metrics):
-                m_str = "No billing authority"
-            elif "avail" in m_str and "pending" in m_str: # Stripe
-                # E.g. €0 avail • €0 pending
-                pass
-            
-            if len(metrics) > 1 and len(set(metrics)) > 1 and "Balance" not in m_str and "avail" not in m_str:
-                m_str = f"{len(metrics)} keys active"
-                
-            if not metrics:
+            if not unique:
                 if any(d['provider'] == p and d['_display_status'] == "Invalid" for d in invalid_keys):
                     m_str = "Invalid/missing key"
                 else:
                     m_str = "No healthy keys"
+            elif len(unique) == 1:
+                m_str = unique[0]
+            else:
+                has_balance = any(
+                    ProbeResult(**d['status']).metric_type in {"BALANCE", "ACCOUNT_BALANCE"} 
+                    for d in known 
+                    if d['provider'] == p and d['_display_status'] in {"Working", "Full", "Read", "Write"}
+                )
+                if has_balance:
+                    m_str = f"{len(metrics)} balance-bearing keys"
+                else:
+                    m_str = f"{len(metrics)} active keys"
                 
             print(f"{p:<13} {w:<8} {i:<7} {m_str}")
         print()
