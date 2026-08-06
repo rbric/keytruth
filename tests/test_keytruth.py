@@ -31,13 +31,15 @@ STRIPE_LIVE_KEY={fake_stripe}
     return tmp_path
 
 class DummyArgs:
-    def __init__(self, paths, unknown=False, group_by_variable=False, reused=False, verbose=False, financial=False, experimental=False, debug=False):
+    def __init__(self, paths, unknown=False, group_by_variable=False, reused=False, verbose=False, financial=False, experimental=False, debug=False, yes=True, all=False):
         self.paths = paths
         self.unknown = unknown
         self.group_by_variable = group_by_variable
         self.reused = reused
         self.verbose = verbose
         self.financial = financial
+        self.yes = yes
+        self.all = all
         self.experimental = experimental
         self.debug = debug
 
