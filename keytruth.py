@@ -690,6 +690,57 @@ def extract_keys(files, capture_unknown=False):
         found_keys[k]['files'] = list(found_keys[k]['files'])
     return found_keys
 
+def display_status(result):
+    if result.metric_type == "PLACEHOLDER" or result.metric_value == "Placeholder":
+        return "Placeholder"
+    if result.auth == "Invalid":
+        return "Invalid"
+    if result.access in {"Full", "Write", "Read"}:
+        return result.access
+    if result.access == "Working":
+        return "Working"
+    if result.access == "Restricted":
+        return "Restricted" if result.auth == "Valid" else "Unverified"
+    if result.access == "Rate-limited":
+        return "Rate limited"
+    if result.auth == "Valid":
+        return "Valid"
+    return "Unknown"
+
+def format_metric_compact(status) -> str:
+    if status.metric_type == "BALANCE":
+        sym = "$" if status.metric_unit == "USD" else status.metric_unit + " "
+        return f"Balance {sym}{status.metric_value:.2f}"
+    elif status.metric_type == "USAGE":
+        if status.metric_limit is not None:
+            return f"Usage {status.metric_value} / {status.metric_limit} {status.metric_unit}".strip()
+        else:
+            return f"Usage {status.metric_value} {status.metric_unit}".strip()
+    elif status.metric_type == "QUOTA":
+        try:
+            val = float(status.metric_value)
+            if status.metric_limit is not None:
+                lim = float(status.metric_limit)
+                return f"{val:,.0f} / {lim:,.0f} {status.metric_unit}".strip()
+            else:
+                return f"{val:,.0f} {status.metric_unit}".strip()
+        except:
+            return str(status.metric_value)
+    elif status.metric_type == "ACCOUNT_BALANCE":
+        try:
+            val = float(status.metric_value)
+            lim = float(status.metric_limit)
+            sym = "€" if status.metric_unit == "EUR" else "$" if status.metric_unit == "USD" else status.metric_unit + " "
+            return f"{sym}{val:g} avail • {sym}{lim:g} pending"
+        except:
+            return str(status.metric_value)
+    elif status.metric_type == "IDENTITY":
+        if status.identity:
+            return f"User: {status.identity}"
+        return str(status.metric_value)
+    else:
+        return str(status.metric_value)
+
 def format_metric(status: ProbeResult) -> str:
     if status.metric_type == "BALANCE":
         sym = "$" if status.metric_unit == "USD" else status.metric_unit + " "
@@ -723,7 +774,11 @@ def format_metric(status: ProbeResult) -> str:
     else:
         return str(status.metric_value)
 
-def print_table(results_cache, reused_only=False):
+def print_table(results_cache, args=None, is_scan=False):
+    show_all = getattr(args, 'all', False) if args else False
+    show_placeholders = getattr(args, 'placeholders', False) if args else False
+    reused_only = getattr(args, 'reused', False) if args else False
+    
     known = [d for d in results_cache if d['provider'] != 'UNKNOWN']
     if reused_only:
         known = [d for d in known if len(d['files']) > 1]
@@ -734,73 +789,213 @@ def print_table(results_cache, reused_only=False):
     term_width = shutil.get_terminal_size((80, 20)).columns
     is_narrow = term_width < 95
     
+    # Calculate provider counts
+    providers = set(d['provider'] for d in known)
+    
+    # Compute severities and format metrics
+    critical_alerts = []
+    probe_issues = []
+    invalid_keys = []
+    review_shared = []
+    
+    for data in known:
+        status = ProbeResult(**data['status'])
+        raw_risk = status.risk
+        
+        if raw_risk == "Low":
+            risk_label = "Normal"
+        elif ":" in raw_risk:
+            risk_label = raw_risk.split(":")[0]
+        elif len(data['files']) > 1:
+            risk_label = "Shared"
+        else:
+            risk_label = "Normal"
+            
+        data['_risk_label'] = risk_label
+        data['_metric_str'] = format_metric(status)
+        data['_metric_compact'] = format_metric_compact(status)
+        data['_display_status'] = display_status(status)
+        
+        # Action required sorting logic
+        is_placeholder = data['_metric_str'] in ("Placeholder", "Empty", "Malformed")
+        if not is_placeholder:
+            st = data['_display_status']
+            if risk_label == "Critical":
+                critical_alerts.append(data)
+            elif st in ("Restricted", "Unverified") or ("error" in data['_metric_str'].lower()) or ("refused" in data['_metric_str'].lower()) or ("failed" in data['_metric_str'].lower()):
+                probe_issues.append(data)
+            elif st == "Invalid" or st == "Placeholder":
+                invalid_keys.append(data)
+            elif risk_label in ("Review", "Shared"):
+                review_shared.append(data)
+
+    # Sort detailed table correctly
+    def sort_weight(data):
+        st = data['_display_status']
+        risk = data['_risk_label']
+        is_ph = data['_metric_str'] in ("Placeholder", "Empty", "Malformed")
+        
+        if risk == "Critical": return 1
+        if st in ("Restricted", "Unverified") or ("error" in data['_metric_str'].lower()) or ("refused" in data['_metric_str'].lower()) or ("failed" in data['_metric_str'].lower()): return 2
+        if st == "Invalid": return 3
+        if risk in ("Review", "Shared"): return 4
+        if not is_ph: return 5
+        return 6
+        
+    known.sort(key=sort_weight)
+
     print(f"{GREEN}KeyTruth v0.1.0{RESET}")
-    print(f"Credentials: {len(known)} found • {len(candidates)} plausible • {len(non_candidates)} placeholders")
+    print(f"{len(known)} credentials • {len(non_candidates)} placeholders • {len(providers)} providers")
+    
+    if critical_alerts or invalid_keys or probe_issues or review_shared:
+        print(f"{len(critical_alerts)} critical • {len(invalid_keys)} invalid • {len(probe_issues)} restricted • {len(review_shared)} shared")
+        
     print(f"Privacy: local-only • no plaintext keys cached")
     print()
 
     if not known:
         return
 
-    # Process risks and alerts
-    alerts = []
-    for data in known:
-        status = ProbeResult(**data['status'])
-        raw_risk = status.risk
-        if raw_risk == "Low":
-            risk_label = "Normal"
-        elif ":" in raw_risk:
-            risk_label = raw_risk.split(":")[0]
-            alerts.append((risk_label, data['provider'], data['hash'][:8], raw_risk.split(":", 1)[1].strip()))
-        elif len(data['files']) > 1:
-            risk_label = "Shared"
-            alerts.append((risk_label, data['provider'], data['hash'][:8], f"appears in {len(data['files'])} files"))
-        else:
-            risk_label = "Normal"
+    if not show_all and not is_scan:
+        # Action Required
+        if critical_alerts or probe_issues or invalid_keys or review_shared:
+            print(f"{CYAN}ACTION REQUIRED{RESET}")
             
-        data['_risk_label'] = risk_label
-        data['_metric_str'] = format_metric(status)
-
-    if is_narrow:
-        for data in known:
-            status = ProbeResult(**data['status'])
-            risk_label = data['_risk_label']
-            print(f"{CYAN}⚠ {data['provider']} {data['hash'][:8]}{RESET}")
-            print(f"  Auth:   {color_status(status.auth)}")
-            print(f"  Access: {color_status(status.access)}")
-            print(f"  Metric: {data['_metric_str']}")
-            print(f"  Risk:   {color_status(risk_label)}")
+            if critical_alerts:
+                print()
+                print("CRITICAL")
+                for d in critical_alerts:
+                    msg = d['status']['risk'].split(":", 1)[1].strip() if ":" in d['status']['risk'] else "Critical risk"
+                    print(f"  {d['provider']:<13} {d['hash'][:8]}  {msg}")
+            
+            if probe_issues:
+                print()
+                print("PROBE ISSUES")
+                for d in probe_issues:
+                    print(f"  {d['provider']:<13} {d['hash'][:8]}  {d['_metric_compact']}")
+                    
+            if invalid_keys:
+                print()
+                print("INVALID")
+                # Group by provider
+                inv_by_prov = {}
+                for d in invalid_keys:
+                    inv_by_prov[d['provider']] = inv_by_prov.get(d['provider'], 0) + 1
+                for p, count in sorted(inv_by_prov.items(), key=lambda x: x[1], reverse=True):
+                    s = "s" if count > 1 else ""
+                    print(f"  {p:<13} {count} key{s}")
+                    
+            if review_shared:
+                print()
+                print("REVIEW / SHARED")
+                for d in review_shared:
+                    msg = f"appears in {len(d['files'])} files" if d['_risk_label'] == "Shared" else d['status']['risk']
+                    print(f"  {d['provider']:<13} {d['hash'][:8]}  {msg}")
             print()
-    else:
-        print("┌──────────┬──────────────┬────────────┬────────────┬──────────────────────────────────────┬──────────┐")
-        print("│ KEY ID   │ PROVIDER     │ AUTH       │ ACCESS     │ METRIC                               │ RISK     │")
-        print("├──────────┼──────────────┼────────────┼────────────┼──────────────────────────────────────┼──────────┤")
-        for data in known:
-            status = ProbeResult(**data['status'])
-            risk_label = data['_risk_label']
-            metric_str = data['_metric_str']
-            # truncate metric if too long
-            if len(metric_str) > 36:
-                metric_str = metric_str[:33] + "..."
+            
+        # Provider Overview
+        print(f"{CYAN}PROVIDERS{RESET}")
+        print("PROVIDER      WORKING  ISSUES  METRIC")
+        
+        prov_stats = {}
+        for d in known:
+            p = d['provider']
+            if p not in prov_stats:
+                prov_stats[p] = {'working': 0, 'issues': 0, 'metrics': []}
+            
+            if d['_display_status'] == "Invalid" or d['_risk_label'] == "Critical" or d in probe_issues:
+                prov_stats[p]['issues'] += 1
                 
-            c_auth = color_status(status.auth)
-            c_acc = color_status(status.access)
-            c_risk = color_status(risk_label)
+            if d['_display_status'] in ("Working", "Full", "Read", "Write", "Valid", "Rate limited"):
+                prov_stats[p]['working'] += 1
+                if d['_metric_compact'] not in ("Placeholder", "Empty", "Malformed"):
+                    prov_stats[p]['metrics'].append(d['_metric_compact'])
+                    
+        for p in sorted(providers):
+            w = prov_stats[p]['working']
+            i = prov_stats[p]['issues']
+            metrics = prov_stats[p]['metrics']
             
-            # calculate visible padding
-            pad_auth = 10 - len(status.auth)
-            pad_acc = 10 - len(status.access)
-            pad_risk = 8 - len(risk_label)
+            m_str = metrics[0] if metrics else "No data"
             
-            print(f"│ {data['hash'][:8]:<8} │ {data['provider']:<12} │ {c_auth}{' '*pad_auth} │ {c_acc}{' '*pad_acc} │ {metric_str:<36} │ {c_risk}{' '*pad_risk} │")
-        print("└──────────┴──────────────┴────────────┴────────────┴──────────────────────────────────────┴──────────┘")
-
-    if alerts:
+            # Aggregate if units match
+            if p == "OPENAI" and all("No balance authority" == m for m in metrics):
+                m_str = "No balance authority"
+            elif p == "ANTHROPIC" and all("No balance endpoint" == m for m in metrics):
+                m_str = "No balance endpoint"
+            elif p == "FAL" and all("No billing authority" == m for m in metrics):
+                m_str = "No billing authority"
+            elif "avail" in m_str and "pending" in m_str: # Stripe
+                # E.g. €0 avail • €0 pending
+                pass
+            
+            if len(metrics) > 1 and len(set(metrics)) > 1 and "Balance" not in m_str and "avail" not in m_str:
+                m_str = f"{len(metrics)} keys active"
+                
+            if not metrics:
+                if any(d['provider'] == p and d['_display_status'] == "Invalid" for d in invalid_keys):
+                    m_str = "Invalid/missing key"
+                else:
+                    m_str = "No healthy keys"
+                
+            print(f"{p:<13} {w:<8} {i:<7} {m_str}")
         print()
-        print(f"{CYAN}Reuse Alerts{RESET}")
-        for r_label, prov, k_id, msg in alerts:
-            color = RED if r_label == "Critical" else YELLOW
-            print(f"{color}●{RESET} {prov} key {k_id} {msg} ({color_status(r_label)})")
+
+    else:
+        # Detailed UI view
+        to_show = known
+        if not show_placeholders:
+            to_show = [d for d in known if d['_metric_str'] not in ("Placeholder", "Empty", "Malformed")]
+            
+        if is_narrow:
+            for data in to_show:
+                risk_label = data['_risk_label']
+                print(f"{CYAN}⚠ {data['provider']} {data['hash'][:8]}{RESET}")
+                
+                disp = data['_display_status']
+                if risk_label == "Normal":
+                    risk_str = ""
+                else:
+                    risk_str = f"  Risk:   {color_status(risk_label)}\n"
+                    
+                print(f"  Status: {color_status(disp)}")
+                print(f"  Metric: {data['_metric_str']}")
+                if risk_str:
+                    print(risk_str, end="")
+                else:
+                    print()
+        else:
+            print("┌──────────┬──────────────┬────────────┬──────────────────────────────────────┬──────────┐")
+            print("│ KEY ID   │ PROVIDER     │ STATUS     │ METRIC                               │ RISK     │")
+            print("├──────────┼──────────────┼────────────┼──────────────────────────────────────┼──────────┤")
+            for data in to_show:
+                risk_label = data['_risk_label']
+                risk_str = "" if risk_label == "Normal" else risk_label
+                
+                metric_str = data['_metric_str']
+                if len(metric_str) > 36:
+                    metric_str = metric_str[:33] + "..."
+                    
+                disp = data['_display_status']
+                c_status = color_status(disp)
+                c_risk = color_status(risk_str) if risk_str else ""
+                
+                pad_status = 10 - len(disp)
+                pad_risk = 8 - len(risk_str)
+                
+                print(f"│ {data['hash'][:8]:<8} │ {data['provider']:<12} │ {c_status}{' '*pad_status} │ {metric_str:<36} │ {c_risk}{' '*pad_risk} │")
+            print("└──────────┴──────────────┴────────────┴──────────────────────────────────────┴──────────┘")
+
+        # Reuse Alerts are shown at bottom of table
+        if (critical_alerts or review_shared) and is_scan:
+            alerts = [(d['_risk_label'], d['provider'], d['hash'][:8], d['status']['risk'] if 'risk' in d['status'] and ":" in d['status']['risk'] else "") for d in critical_alerts + review_shared]
+            print()
+            print(f"{CYAN}Reuse Alerts{RESET}")
+            for r_label, prov, k_id, msg in alerts:
+                if ":" in msg: msg = msg.split(":", 1)[1].strip()
+                if not msg and r_label == "Shared": msg = "appears in multiple files"
+                color = RED if r_label == "Critical" else YELLOW
+                print(f"{color}●{RESET} {prov} key {k_id} {msg} ({color_status(r_label)})")
 
 def print_discovery_report(results_cache):
     unknowns = [d for d in results_cache if d['provider'] == 'UNKNOWN']
@@ -849,8 +1044,14 @@ def main():
     probe_parser.add_argument('--financial', action='store_true', help="Opt-in to querying sensitive financial credentials like Stripe")
     probe_parser.add_argument('--experimental', action='store_true', help="Enable undocumented/fragile endpoints (like OpenAI credit_grants)")
     probe_parser.add_argument('--debug', action='store_true', help="Print complete network trace and classification logs")
+    probe_parser.add_argument('--all', action='store_true', help="Show the complete detailed credential table")
+    probe_parser.add_argument('--placeholders', action='store_true', help="Include placeholders in the detailed table (implies --all)")
+    probe_parser.add_argument('--reused', action='store_true', help="Only show credentials reused across multiple files")
     
     args = parser.parse_args()
+
+    if getattr(args, 'placeholders', False):
+        args.all = True
 
     if args.command == 'scan':
         run_scan(args)
@@ -891,7 +1092,7 @@ def run_scan(args):
     
     write_cache(cache_payload)
     print(f"\nLocal inventory saved securely to {CACHE_FILE}")
-    print_table(results_cache, reused_only=args.reused)
+    print_table(results_cache, args=args, is_scan=True)
     if args.unknown:
         if args.group_by_variable:
             print_discovery_report(results_cache)
@@ -979,7 +1180,7 @@ def run_probe(args):
     if args.debug:
         print_debug(results_cache)
         
-    print_table(results_cache, reused_only=False)
+    print_table(results_cache, args=args, is_scan=False)
     
     cache_to_save = []
     for rc in results_cache:
