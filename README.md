@@ -45,7 +45,7 @@ This returns precisely where the key is located and provides targeted recommenda
 
 ## 4. Verify
 
-After rotating or deleting the key, simply run the scan and probe again. KeyTruth will automatically tell you what has been resolved!
+After rotating or deleting the key, simply run the scan and probe again to verify that the issue has been resolved.
 
 ```bash
 keytruth scan .

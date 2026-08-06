@@ -992,7 +992,7 @@ def print_provider_panel(known, invalid_keys, probe_issues, term_width):
         print(line)
     print()
 
-def print_table(results_cache, args=None, is_scan=False, files_count=0):
+def print_table(results_cache, args=None, is_scan=False, files_count=0, prev_state=None):
     show_all = getattr(args, 'all', False) if args else False
     show_placeholders = getattr(args, 'placeholders', False) if args else False
     reused_only = getattr(args, 'reused', False) if args else False
@@ -1065,9 +1065,82 @@ def print_table(results_cache, args=None, is_scan=False, files_count=0):
     if not show_all:
         if is_scan:
             print_local_inventory_panel(files_count, known, candidates, non_candidates, critical_alerts, review_shared, term_width)
+            
+            if prev_state:
+                curr_dict = {d['hash']: d for d in known}
+                prev_dict = {d['hash']: d for d in prev_state if d['provider'] != 'UNKNOWN'}
+                
+                res_lines = []
+                for h, p_data in prev_dict.items():
+                    p_raw_risk = p_data['status'].get('risk', 'Low')
+                    if p_raw_risk == "Low": p_risk = "Normal"
+                    elif ":" in p_raw_risk: p_risk = p_raw_risk.split(":")[0]
+                    elif len(p_data['files']) > 1: p_risk = "Shared"
+                    else: p_risk = "Normal"
+                    
+                    c_data = curr_dict.get(h)
+                    
+                    if not c_data:
+                        res_lines.append(f"{GREEN}✓{RESET} {p_data['provider']} {h[:8]} removed")
+                        continue
+                        
+                    c_risk = c_data.get('_risk_label', 'Normal')
+                    
+                    if p_risk == "Shared" and c_risk != "Shared" and c_risk != "Critical":
+                        res_lines.append(f"{GREEN}✓{RESET} {p_data['provider']} {h[:8]} no longer reused")
+                    elif p_risk == "Critical" and c_risk != "Critical":
+                        res_lines.append(f"{GREEN}✓{RESET} {p_data['provider']} {h[:8]} critical reuse reduced")
+                
+                if res_lines:
+                    for line in panel_lines("RESOLVED SINCE LAST SCAN", res_lines, term_width if term_width < 80 else 80):
+                        print(line)
+                    print()
         else:
             print_header_dashboard(known, candidates, non_candidates, critical_alerts, invalid_keys, probe_issues, set(d['provider'] for d in known), is_scan, term_width)
             print_action_panel(critical_alerts, probe_issues, invalid_keys, review_shared, term_width)
+            
+            # Print resolutions if any
+            if prev_state:
+                curr_dict = {d['hash']: d for d in known}
+                prev_dict = {d['hash']: d for d in prev_state if d['provider'] != 'UNKNOWN'}
+                
+                res_lines = []
+                for h, p_data in prev_dict.items():
+                    p_st = display_status(ProbeResult(**p_data['status']))
+                    # reconstruct p_risk
+                    p_raw_risk = p_data['status'].get('risk', 'Low')
+                    if p_raw_risk == "Low": p_risk = "Normal"
+                    elif ":" in p_raw_risk: p_risk = p_raw_risk.split(":")[0]
+                    elif len(p_data['files']) > 1: p_risk = "Shared"
+                    else: p_risk = "Normal"
+                    
+                    c_data = curr_dict.get(h)
+                    
+                    if not c_data:
+                        if not is_scan:
+                            res_lines.append(f"{GREEN}✓{RESET} {p_data['provider']} {h[:8]} removed")
+                        continue
+                        
+                    c_st = c_data.get('_display_status', 'Unknown')
+                    c_risk = c_data.get('_risk_label', 'Normal')
+                    
+                    if not is_scan:
+                        if p_st == "Invalid" and c_st in ("Working", "Full", "Read", "Write"):
+                            res_lines.append(f"{GREEN}✓{RESET} {p_data['provider']} {h[:8]} Invalid → Working")
+                        elif p_st in ("Restricted", "Unverified") and c_st in ("Working", "Full", "Read", "Write"):
+                            res_lines.append(f"{GREEN}✓{RESET} {p_data['provider']} {h[:8]} Restricted → Working")
+                        elif "error" in format_metric(ProbeResult(**p_data['status'])).lower() and "error" not in c_data.get('_metric_str', '').lower() and c_st in ("Working", "Full", "Read", "Write"):
+                            res_lines.append(f"{GREEN}✓{RESET} {p_data['provider']} {h[:8]} Probe error → Working")
+                        elif p_risk == "Critical" and c_risk in ("Shared", "Normal"):
+                            res_lines.append(f"{GREEN}✓{RESET} {p_data['provider']} {h[:8]} Critical → {c_risk}")
+                        elif c_st == "Invalid" and p_st in ("Working", "Full", "Read", "Write"):
+                            res_lines.append(f"{RED}!{RESET} {c_data['provider']} {h[:8]} changed from Working to Invalid")
+                
+                if res_lines:
+                    title = "CHANGED SINCE LAST PROBE"
+                    for line in panel_lines(title, res_lines, term_width if term_width < 80 else 80):
+                        print(line)
+                    print()
             print_metric_panels(known, term_width)
             print_provider_panel(known, invalid_keys, probe_issues, term_width)
             
@@ -1188,6 +1261,11 @@ def main():
     probe_parser.add_argument('--placeholders', action='store_true', help="Include placeholders in the detailed table (implies --all)")
     probe_parser.add_argument('--reused', action='store_true', help="Only show credentials reused across multiple files")
     probe_parser.add_argument('--no-color', action='store_true', help="Disable ANSI color output")
+    probe_parser.add_argument('--yes', action='store_true', help="Skip interactive trust prompt on first probe")
+    
+    show_parser = subparsers.add_parser('show', help="Show details and recommendations for a specific key")
+    show_parser.add_argument('key_id', help="The hash ID prefix of the key to inspect")
+    show_parser.add_argument('--no-color', action='store_true', help="Disable ANSI color output")
     
     args = parser.parse_args()
     setup_colors(args)
@@ -1199,6 +1277,8 @@ def main():
         run_scan(args)
     elif args.command == 'probe':
         run_probe(args)
+    elif args.command == 'show':
+        run_show(args)
 
 def run_scan(args):
     print(f"Scanning {', '.join(args.paths)} for .env files (local only)...")
@@ -1227,6 +1307,20 @@ def run_scan(args):
             'files': data['files']
         })
         
+    prev_scan = {}
+    if CACHE_FILE.exists():
+        try:
+            with open(CACHE_FILE, 'r') as f:
+                c_data = json.load(f)
+                p_scan = c_data.get('scan', {})
+                # Check roots match
+                r_old = set(p_scan.get('roots', []))
+                r_new = set([str(Path(p).resolve()) for p in args.paths])
+                if r_old == r_new:
+                    prev_scan = p_scan
+        except Exception:
+            pass
+
     cache_payload = {
         "schema_version": 3,
         "scan": {
@@ -1239,7 +1333,7 @@ def run_scan(args):
     
     write_cache(cache_payload)
     print(f"\nLocal inventory saved securely to {CACHE_FILE}")
-    print_table(results_cache, args=args, is_scan=True, files_count=len(files))
+    print_table(results_cache, args=args, is_scan=True, files_count=len(files), prev_state=prev_scan.get('inventory', []))
     if args.unknown:
         if args.group_by_variable:
             print_discovery_report(results_cache)
@@ -1273,6 +1367,34 @@ def run_probe(args):
         
     scan_data = cache_data.get("scan", {})
     roots = args.paths if args.paths else scan_data.get("roots", ["."])
+    
+    probe_data = cache_data.get("probe", {})
+    first_probe = not probe_data or not probe_data.get("results")
+    
+    if first_probe and not getattr(args, 'yes', False):
+        if not sys.stdin.isatty():
+            print("First network probe requires --yes in non-interactive mode.", file=sys.stderr)
+            sys.exit(1)
+        prompt = (
+            "\nKeyTruth will send each credential directly to its provider\n"
+            "using read-only or free verification endpoints.\n\n"
+            "Nothing is uploaded to KeyTruth.\n"
+            "No plaintext keys are cached.\n\n"
+            "Continue? [y/N] "
+        )
+        try:
+            if input(prompt).strip().lower() not in {"y", "yes"}:
+                print("Probe cancelled. No network requests were made.")
+                sys.exit(0)
+        except EOFError:
+            print("Probe cancelled. No network requests were made.")
+            sys.exit(0)
+            
+    prev_probe_results = []
+    r_old = set(scan_data.get('roots', []))
+    r_new = set([str(Path(p).resolve()) for p in roots])
+    if r_old == r_new and probe_data.get("results"):
+        prev_probe_results = probe_data.get("results")
     
     if not args.debug:
         print(f"Rescanning {', '.join(roots)} to find raw keys...")
@@ -1327,7 +1449,7 @@ def run_probe(args):
     if args.debug:
         print_debug(results_cache)
         
-    print_table(results_cache, args=args, is_scan=False)
+    print_table(results_cache, args=args, is_scan=False, prev_state=prev_probe_results)
     
     cache_to_save = []
     for rc in results_cache:
@@ -1350,5 +1472,77 @@ def run_probe(args):
     
     write_cache(cache_data)
 
+
+def run_show(args):
+    if not CACHE_FILE.exists():
+        print("No cache found. Run `keytruth scan .` first.")
+        return
+        
+    with open(CACHE_FILE, 'r') as f:
+        cache_data = json.load(f)
+        
+    pool = cache_data.get("probe", {}).get("results", [])
+    if not pool:
+        pool = cache_data.get("scan", {}).get("inventory", [])
+        
+    matches = [d for d in pool if d['hash'].startswith(args.key_id)]
+    if len(matches) == 0:
+        print(f"Key ID {args.key_id} not found in cache.")
+        return
+    if len(matches) > 1:
+        print(f"Key ID \"{args.key_id}\" matches {len(matches)} credentials. Provide more characters.")
+        return
+        
+    data = matches[0]
+    
+    status = ProbeResult(**data['status'])
+    raw_risk = status.risk
+    if raw_risk == "Low":
+        risk_label = "Normal"
+    elif ":" in raw_risk:
+        risk_label = raw_risk.split(":")[0]
+    elif len(data['files']) > 1:
+        risk_label = "Shared"
+    else:
+        risk_label = "Normal"
+        
+    disp = display_status(status)
+    
+    RECOMMENDATIONS = {
+        "critical_reuse": "Create separate restricted keys before revoking this one.",
+        "shared": "Confirm every listed project still needs this credential.",
+        "invalid": "Remove it if unused, or replace it with a valid credential.",
+        "restricted": "Review the provider permissions or IP restrictions.",
+        "probe_error": "Retry the probe and inspect the provider response.",
+    }
+    
+    rec = ""
+    if risk_label == "Critical":
+        rec = RECOMMENDATIONS["critical_reuse"]
+        risk_str = "Critical — " + (raw_risk.split(":", 1)[1].strip() if ":" in raw_risk else "risk")
+    elif risk_label == "Shared":
+        rec = RECOMMENDATIONS["shared"]
+        risk_str = "Shared — multiple files"
+    elif disp == "Invalid":
+        rec = RECOMMENDATIONS["invalid"]
+        risk_str = "Normal"
+    elif disp in ("Restricted", "Unverified"):
+        rec = RECOMMENDATIONS["restricted"]
+        risk_str = "Normal"
+    elif "error" in format_metric(status).lower() or "failed" in format_metric(status).lower():
+        rec = RECOMMENDATIONS["probe_error"]
+        risk_str = "Normal"
+    else:
+        risk_str = "Normal"
+        rec = "No action required. Key is healthy."
+        
+    print(f"{data['provider']} {data['hash'][:8]}")
+    print(f"Status: {disp}")
+    print(f"Risk: {risk_str}")
+    print("\nFound in:")
+    for f in data['files']:
+        print(f"  {f}")
+    print("\nRecommended action:")
+    print(f"  {rec}")
 if __name__ == "__main__":
     main()

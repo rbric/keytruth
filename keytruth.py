@@ -1307,20 +1307,6 @@ def run_scan(args):
             'files': data['files']
         })
         
-    prev_scan = {}
-    if CACHE_FILE.exists():
-        try:
-            with open(CACHE_FILE, 'r') as f:
-                c_data = json.load(f)
-                p_scan = c_data.get('scan', {})
-                # Check roots match
-                r_old = set(p_scan.get('roots', []))
-                r_new = set([str(Path(p).resolve()) for p in args.paths])
-                if r_old == r_new:
-                    prev_scan = p_scan
-        except Exception:
-            pass
-
     cache_payload = {
         "schema_version": 3,
         "scan": {
@@ -1333,7 +1319,7 @@ def run_scan(args):
     
     write_cache(cache_payload)
     print(f"\nLocal inventory saved securely to {CACHE_FILE}")
-    print_table(results_cache, args=args, is_scan=True, files_count=len(files), prev_state=prev_scan.get('inventory', []))
+    print_table(results_cache, args=args, is_scan=True, files_count=len(files))
     if args.unknown:
         if args.group_by_variable:
             print_discovery_report(results_cache)
@@ -1390,12 +1376,6 @@ def run_probe(args):
             print("Probe cancelled. No network requests were made.")
             sys.exit(0)
             
-    prev_probe_results = []
-    r_old = set(scan_data.get('roots', []))
-    r_new = set([str(Path(p).resolve()) for p in roots])
-    if r_old == r_new and probe_data.get("results"):
-        prev_probe_results = probe_data.get("results")
-    
     if not args.debug:
         print(f"Rescanning {', '.join(roots)} to find raw keys...")
     files = find_env_files(roots, verbose=False)
@@ -1449,7 +1429,7 @@ def run_probe(args):
     if args.debug:
         print_debug(results_cache)
         
-    print_table(results_cache, args=args, is_scan=False, prev_state=prev_probe_results)
+    print_table(results_cache, args=args, is_scan=False)
     
     cache_to_save = []
     for rc in results_cache:
@@ -1508,32 +1488,17 @@ def run_show(args):
         
     disp = display_status(status)
     
-    RECOMMENDATIONS = {
-        "critical_reuse": "Create separate restricted keys before revoking this one.",
-        "shared": "Confirm every listed project still needs this credential.",
-        "invalid": "Remove it if unused, or replace it with a valid credential.",
-        "restricted": "Review the provider permissions or IP restrictions.",
-        "probe_error": "Retry the probe and inspect the provider response.",
-    }
-    
-    rec = ""
     if risk_label == "Critical":
-        rec = RECOMMENDATIONS["critical_reuse"]
+        rec = "Separate the projects before revoking this key."
         risk_str = "Critical — " + (raw_risk.split(":", 1)[1].strip() if ":" in raw_risk else "risk")
-    elif risk_label == "Shared":
-        rec = RECOMMENDATIONS["shared"]
-        risk_str = "Shared — multiple files"
     elif disp == "Invalid":
-        rec = RECOMMENDATIONS["invalid"]
+        rec = "Remove or replace this credential."
         risk_str = "Normal"
     elif disp in ("Restricted", "Unverified"):
-        rec = RECOMMENDATIONS["restricted"]
-        risk_str = "Normal"
-    elif "error" in format_metric(status).lower() or "failed" in format_metric(status).lower():
-        rec = RECOMMENDATIONS["probe_error"]
+        rec = "Check its provider permissions."
         risk_str = "Normal"
     else:
-        risk_str = "Normal"
+        risk_str = "Normal" if risk_label != "Shared" else "Shared — multiple files"
         rec = "No action required. Key is healthy."
         
     print(f"{data['provider']} {data['hash'][:8]}")
