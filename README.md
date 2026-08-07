@@ -17,7 +17,13 @@ pipx install .
 pip install .
 ```
 
-From a git checkout path:
+From GitHub (after push):
+
+```bash
+pipx install git+https://github.com/rbric/keytruth.git
+```
+
+From a local checkout:
 
 ```bash
 pipx install /path/to/keys-cli
