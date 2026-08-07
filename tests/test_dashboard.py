@@ -1,20 +1,14 @@
 import sys
 import io
-from pathlib import Path
-from keytruth import (
-    print_table, ProbeResult,
-    setup_colors, ANSI_RE
-)
+import json
+from keytruth import print_table, setup_colors
 from argparse import Namespace
 
-def test_dashboard_ansi_disabled():
-    # Setup mock data
-    args = Namespace(no_color=True, all=False, placeholders=False, reused=False)
-    setup_colors(args)
-    
-    cache = [{
+
+def _sample_cache():
+    return [{
         'provider': 'OPENAI', 'var_name': 'OPENAI_API_KEY',
-        'masked_key': 'sk-proj-1234', 'hash': 'abcdef12', 'files': ['a.env'],
+        'masked_key': 'sk-proj-1234', 'hash': 'abcdef12aaaa', 'files': ['a.env'],
         'status': {
             'provider': 'OPENAI', 'category': 'CANDIDATE', 'auth': 'Valid',
             'funding': 'Unknown', 'access': 'Working', 'metric_type': 'NONE',
@@ -22,31 +16,47 @@ def test_dashboard_ansi_disabled():
             'identity': None, 'risk': 'Low', 'checked_at': '', 'http_status': 200,
             'debug_logs': []
         }
+    }, {
+        'provider': 'STRIPE', 'var_name': 'STRIPE_SECRET_KEY',
+        'masked_key': 'sk_live_xxxx', 'hash': 'bbbbbbbbbbbb', 'files': ['a.env', 'b.env'],
+        'status': {
+            'provider': 'STRIPE', 'category': 'CANDIDATE', 'auth': 'Detected',
+            'funding': 'Unknown', 'access': 'Not probed', 'metric_type': 'NONE',
+            'metric_value': 'Live key — opt-in required', 'metric_limit': None, 'metric_unit': '',
+            'identity': None, 'risk': 'Critical: reused in 2 files', 'checked_at': '',
+            'http_status': None, 'debug_logs': []
+        }
     }]
-    
+
+
+def test_fact_table_no_ansi():
+    args = Namespace(no_color=True, placeholders=False, reused=False, json=False)
+    setup_colors(args)
+
     stdout = io.StringIO()
     sys.stdout = stdout
     try:
-        print_table(cache, args=args, is_scan=False, files_count=1)
+        print_table(_sample_cache(), args=args, is_scan=False, files_count=2)
     finally:
         sys.stdout = sys.__stdout__
-        
-    out = stdout.getvalue()
-    # Ensure no ANSI
-    assert "\x1b" not in out
-    
-    # Ensure dashboard boxes are drawn
-    assert "╭─ ACTION REQUIRED" in out
-    assert "╭─ PROVIDERS" in out
-    assert "● OPENAI" in out # no emoji, reliable char
 
-def test_scan_unprobed():
-    args = Namespace(no_color=True, all=False, placeholders=False, reused=False)
+    out = stdout.getvalue()
+    assert "\x1b" not in out
+    assert "PROVIDER" in out
+    assert "CRITICAL" in out
+    assert "OPENAI" in out
+    assert "STRIPE" in out
+    assert "╭─" not in out
+    assert "ACTION REQUIRED" not in out
+
+
+def test_scan_facts():
+    args = Namespace(no_color=True, placeholders=True, reused=False, json=False)
     setup_colors(args)
-    
+
     cache = [{
         'provider': 'OPENAI', 'var_name': 'OPENAI_API_KEY',
-        'masked_key': 'sk-proj-1234', 'hash': 'abcdef12', 'files': ['a.env'],
+        'masked_key': 'sk-proj-1234', 'hash': 'abcdef12aaaa', 'files': ['a.env'],
         'status': {
             'provider': 'OPENAI', 'category': 'CANDIDATE', 'auth': 'Unknown',
             'funding': 'Unknown', 'access': 'Unknown', 'metric_type': 'NONE',
@@ -56,7 +66,7 @@ def test_scan_unprobed():
         }
     }, {
         'provider': 'STRIPE', 'var_name': 'STRIPE_SECRET_KEY',
-        'masked_key': 'replace-me', 'hash': 'fedcba21', 'files': ['b.env'],
+        'masked_key': 'replace-me', 'hash': 'fedcba21bbbb', 'files': ['b.env'],
         'status': {
             'provider': 'STRIPE', 'category': 'PLACEHOLDER', 'auth': 'Not tested',
             'funding': 'Unknown', 'access': 'None', 'metric_type': 'NONE',
@@ -65,44 +75,33 @@ def test_scan_unprobed():
             'debug_logs': []
         }
     }]
-    
+
     stdout = io.StringIO()
     sys.stdout = stdout
     try:
         print_table(cache, args=args, is_scan=True, files_count=2)
     finally:
         sys.stdout = sys.__stdout__
-        
-    out = stdout.getvalue()
-    assert "LOCAL INVENTORY" in out
-    assert "1 credentials · 1 skipped · 1 providers" in out
 
-def test_long_provider_metric_truncated():
-    args = Namespace(no_color=True, all=False, placeholders=False, reused=False)
+    out = stdout.getvalue()
+    assert "scan" in out
+    assert "OPENAI" in out
+    assert "Placeholder" in out
+
+
+def test_json_output():
+    args = Namespace(no_color=True, placeholders=False, reused=False, json=True)
     setup_colors(args)
-    
-    cache = [{
-        'provider': 'LONGPROV', 'var_name': 'LONG_KEY',
-        'masked_key': '...', 'hash': 'abcdef12', 'files': ['a.env'],
-        'status': {
-            'provider': 'LONGPROV', 'category': 'CANDIDATE', 'auth': 'Valid',
-            'funding': 'Unknown', 'access': 'Working', 'metric_type': 'NONE',
-            'metric_value': 'A very long string that should get truncated because it exceeds the terminal width allowed for this column definitely yes it should',
-            'metric_limit': None, 'metric_unit': '', 'identity': None, 'risk': 'Low',
-            'checked_at': '', 'http_status': 200, 'debug_logs': []
-        }
-    }]
-    
+
     stdout = io.StringIO()
     sys.stdout = stdout
     try:
-        print_table(cache, args=args, is_scan=False, files_count=1)
+        print_table(_sample_cache(), args=args, is_scan=False)
     finally:
         sys.stdout = sys.__stdout__
-        
-    out = stdout.getvalue()
-    assert "…" in out # Should contain truncation
-    
-    # Verify no line exceeds roughly 150 chars
-    for line in out.splitlines():
-        assert len(line) < 150
+
+    data = json.loads(stdout.getvalue())
+    assert isinstance(data, list)
+    assert {d["provider"] for d in data} >= {"OPENAI", "STRIPE"}
+    stripe = next(d for d in data if d["provider"] == "STRIPE")
+    assert stripe["risk"] == "CRITICAL"

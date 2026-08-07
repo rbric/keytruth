@@ -31,7 +31,7 @@ STRIPE_LIVE_KEY={fake_stripe}
     return tmp_path
 
 class DummyArgs:
-    def __init__(self, paths, unknown=False, group_by_variable=False, reused=False, verbose=False, financial=False, experimental=False, debug=False, yes=True, all=False):
+    def __init__(self, paths, unknown=False, group_by_variable=False, reused=False, verbose=False, financial=False, experimental=False, debug=False, yes=True, placeholders=False, json=False):
         self.paths = paths
         self.unknown = unknown
         self.group_by_variable = group_by_variable
@@ -39,9 +39,11 @@ class DummyArgs:
         self.verbose = verbose
         self.financial = financial
         self.yes = yes
-        self.all = all
+        self.placeholders = placeholders
+        self.json = json
         self.experimental = experimental
         self.debug = debug
+        self.no_color = True
 
 def test_scan_is_offline(monkeypatch, test_dir):
     def network_forbidden(*args, **kwargs):
@@ -154,7 +156,7 @@ def test_stripe_live_reuse(monkeypatch, test_dir):
     stripe_entries = [d for d in probe_results if d['provider'] == 'STRIPE' and d['masked_key'].startswith('sk_live_')]
     assert len(stripe_entries) == 1
     stripe = stripe_entries[0]
-    assert stripe['status']['risk'] == "Critical: Live key reuse across projects"
+    assert stripe['status']['risk'] == "Critical: reused in 2 files"
     
     # Verify amounts didn't leak into cache
     cache_text = mock_cache.read_text()

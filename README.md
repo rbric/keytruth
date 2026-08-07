@@ -5,49 +5,49 @@ Check which ones still work.
 Detect dangerous reuse.
 Nothing leaves your machine.
 
-## Install
-
 ```bash
-pipx install keytruth
+python3 keytruth.py scan .
+python3 keytruth.py probe --yes
+python3 keytruth.py show <key-id>
 ```
 
----
+Or: `pipx install keytruth`
 
-## 1. Local Scan
+## Output
 
-Scan your local projects to find credentials without sending anything over the network:
+Default is a fact table. No dashboard.
 
-```bash
-keytruth scan .
+```
+keytruth 0.1.0  probe  files=-  creds=3/3  providers=2  critical=1  invalid=0
+PROVIDER     KEY      AUTH       ACCESS       RISK     FILES  METRIC
+------------------------------------------------------------------------
+STRIPE       bbbbbbbb Detected   Not probed   CRITICAL     2  Live key — opt-in required
+OPENAI       abcdef12 Valid      Working      NONE         1  Balance $12.40
 ```
 
-This generates a fast, local-only inventory of keys and any placeholders found.
+Flags that matter:
 
-## 2. Probe
+- `--json` — machine output
+- `--debug` — print the wire (URL, status, body slice, classification)
+- `--reused` — only multi-file credentials
+- `--placeholders` — include empty/placeholder values
+- `--financial` — opt-in Stripe balance probe
+- `--yes` — skip first-probe trust prompt
 
-Check if the keys actually work by testing them against their provider networks. KeyTruth uses read-only verification endpoints. No plaintext keys are cached.
+## Rules
 
-```bash
-keytruth probe
-```
+1. `scan` never hits the network.
+2. Cache is `~/.api_keys_cache.json` mode `0600`. No plaintext keys.
+3. Same candidate key in >1 file → `CRITICAL`. Placeholders don't count.
+4. Stripe live balance requires `--financial`.
 
-The CLI defaults to an actionable dashboard that groups your working keys and flags any invalid or reused credentials.
-
-## 3. Act
-
-When the dashboard highlights an issue (e.g., a reused live key or invalid credentials), drill down to inspect it:
-
-```bash
-keytruth show <key-id>
-```
-
-This returns precisely where the key is located and provides targeted recommendations to fix it.
-
-## 4. Verify
-
-After rotating or deleting the key, simply run the scan and probe again to verify that the issue has been resolved.
+## Flow
 
 ```bash
-keytruth scan .
-keytruth probe
+keytruth scan ~
+keytruth probe --yes
+keytruth show a1b2c3d4
+# rotate / delete
+keytruth scan ~
+keytruth probe --yes
 ```
