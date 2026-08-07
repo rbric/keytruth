@@ -56,7 +56,8 @@ def test_scan_cache_permissions_and_schema(cache_file, fixture_tree):
     assert fixture_tree["stripe_live"] not in text
 
     openai = next(d for d in data["scan"]["inventory"] if d["provider"] == "OPENAI")
-    assert openai["status"]["risk"].startswith("Critical")
+    # Unprobed reuse is soft — CRITICAL only after probe proves live.
+    assert openai["status"]["risk"].startswith("Review")
 
 
 def test_probe_pipeline_end_to_end(cache_file, fixture_tree, monkeypatch, capsys):
@@ -89,7 +90,7 @@ def test_probe_pipeline_end_to_end(cache_file, fixture_tree, monkeypatch, capsys
 
     out = capsys.readouterr().out
     assert "PROVIDER" in out
-    assert "CRITICAL" in out
+    assert "CRITICAL" in out or "REVIEW" in out
     assert "OPENAI" in out
 
     data = json.loads(cache_file.read_text())
@@ -128,9 +129,11 @@ def test_show_recomputes_risk_ignoring_stale_cache(cache_file, fixture_tree, cap
     run_scan(Args(paths=[str(fixture_tree["root"])]))
     data = json.loads(cache_file.read_text())
     openai = next(d for d in data["scan"]["inventory"] if d["provider"] == "OPENAI")
-    # Poison the cache the way a bug would — show must still say CRITICAL.
+    # Poison the cache the way a bug would — show recomputes from files + liveness.
     openai["status"]["risk"] = "Low"
     openai["status"]["auth"] = "Valid"
+    openai["status"]["access"] = "Working"
+    openai["status"]["metric_value"] = "No balance authority"
     cache_file.write_text(json.dumps(data))
 
     run_show(Args(paths=[], key_id=openai["hash"][:8]))

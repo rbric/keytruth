@@ -766,19 +766,44 @@ def is_stripe_test(data) -> bool:
     masked = data.get("masked_key") or ""
     return data.get("provider") == "STRIPE" and masked.startswith("sk_test_")
 
+def is_proven_live(data) -> bool:
+    """True only after probe (or Stripe detect) says this credential is real."""
+    status = data.get("status") or {}
+    mv = status.get("metric_value")
+    auth = status.get("auth", "")
+    access = status.get("access", "")
+    if mv in NON_CANDIDATE or mv == "Unprobed":
+        return False
+    if is_stripe_test(data) or auth == "Invalid":
+        return False
+    if auth == "Detected":
+        return True  # Stripe live shape, opt-in for balance
+    if auth == "Valid":
+        return True
+    if access in ("Working", "Full", "Read", "Write", "Restricted", "Rate-limited"):
+        return True
+    return False
+
 def compute_risk(data) -> str:
-    """Derive risk from files + key kind. Never trust cached status.risk."""
+    """Derive risk from files + liveness. Never trust cached status.risk.
+
+    CRITICAL only for reused keys proven live (probe/detect).
+    Unprobed reuse — including real keys parked in .env.example — is REVIEW
+    until probe upgrades it. Dead/test reuse stays REVIEW.
+    """
     mv = (data.get("status") or {}).get("metric_value")
     live = active_files(data.get("files", []))
     if mv in NON_CANDIDATE or len(live) <= 1:
         return "Low"
     auth = (data.get("status") or {}).get("auth", "")
-    # Test Stripe / dead keys: inventory noise, not fire.
     if is_stripe_test(data):
         return f"Review: test key reused in {len(live)} files"
     if auth == "Invalid":
         return f"Review: dead key reused in {len(live)} files"
-    return f"Critical: reused in {len(live)} files"
+    if is_proven_live(data):
+        return f"Critical: reused in {len(live)} files"
+    # scan / unknown: shared, but we have not proven it burns money yet
+    return f"Review: shared in {len(live)} files — probe to confirm"
 
 def risk_label(risk_or_status) -> str:
     """Accept a risk string or ProbeResult (legacy). Prefer compute_risk(data)."""
@@ -1235,8 +1260,10 @@ def run_show(args):
         rec = "Stop sharing this key across projects. Rotate after you split them."
     elif risk == "REVIEW" and is_stripe_test(data):
         rec = "Test key reused — fine for local, don't ship it."
-    elif risk == "REVIEW":
+    elif risk == "REVIEW" and status.auth == "Invalid":
         rec = "Dead key still copied around — delete the leftovers."
+    elif risk == "REVIEW":
+        rec = "Shared across files — run probe; if Valid, treat as critical and rotate."
     elif status.auth == "Invalid":
         rec = "Delete or replace it."
     elif status.access in ("Restricted", "Rate-limited"):

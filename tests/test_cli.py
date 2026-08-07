@@ -50,7 +50,7 @@ keytruth.main()
     assert r.returncode == 0, r.stderr
     data = json.loads(r.stdout)
     assert isinstance(data, list)
-    assert any(d["provider"] == "OPENAI" and d["risk"] == "CRITICAL" for d in data)
+    assert any(d["provider"] == "OPENAI" and d["risk"] == "REVIEW" for d in data)
     assert cache.exists()
     assert openai not in cache.read_text()
 

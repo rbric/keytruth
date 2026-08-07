@@ -9,10 +9,25 @@ description = "A local-only CLI that discovers API credentials, proves which one
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT License" }
+authors = [{ name = "rbric" }]
 dependencies = []
+keywords = ["security", "secrets", "api-keys", "cli", "env"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Topic :: Security",
+]
+
+[project.urls]
+Homepage = "https://github.com/rbric/keytruth"
+Repository = "https://github.com/rbric/keytruth"
+Issues = "https://github.com/rbric/keytruth/issues"
+Changelog = "https://github.com/rbric/keytruth/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "build"]
 
 [project.scripts]
 keytruth = "keytruth:main"
