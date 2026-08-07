@@ -18,12 +18,14 @@ Or: `pipx install keytruth`
 Default is a fact table. No dashboard.
 
 ```
-keytruth 0.1.0  probe  files=-  creds=3/3  providers=2  critical=1  invalid=0
+keytruth 0.1.0  probe · 2 files · 2 keys · 0 skipped · 1 critical · 0 invalid
 PROVIDER     KEY      AUTH       ACCESS       RISK     FILES  METRIC
 ------------------------------------------------------------------------
 STRIPE       bbbbbbbb Detected   Not probed   CRITICAL     2  Live key — opt-in required
 OPENAI       abcdef12 Valid      Working      NONE         1  Balance $12.40
 ```
+
+`scan` only prints provider / key / risk / files (no fake auth columns).
 
 Flags that matter:
 
@@ -38,8 +40,11 @@ Flags that matter:
 
 1. `scan` never hits the network.
 2. Cache is `~/.api_keys_cache.json` mode `0600`. No plaintext keys.
-3. Same candidate key in >1 file → `CRITICAL`. Placeholders don't count.
-4. Stripe live balance requires `--financial`.
+3. Risk is always recomputed from files (cache `status.risk` is not trusted).
+4. Live key in >1 non-backup file → `CRITICAL`. `.env.backup` / `.bak` don't count.
+5. Reused `sk_test_` or dead (Invalid) keys → `REVIEW`, not CRITICAL.
+6. Stripe live balance requires `--financial`.
+7. Working keys with no billing endpoint show metric `-`, not an error string.
 
 ## Flow
 

@@ -46,8 +46,14 @@ def test_fact_table_no_ansi():
     assert "CRITICAL" in out
     assert "OPENAI" in out
     assert "STRIPE" in out
+    assert "critical" in out
+    assert "invalid" in out
     assert "╭─" not in out
     assert "ACTION REQUIRED" not in out
+    # Invalid/critical before Working-ish noise; Stripe CRITICAL before OPENAI NONE... 
+    # Sort: CRITICAL first — STRIPE (critical) appears before non-critical OPENAI? 
+    # OPENAI is Valid/Working risk NONE → tier 3; STRIPE CRITICAL → tier 0
+    assert out.index("STRIPE") < out.index("OPENAI")
 
 
 def test_scan_facts():
@@ -86,7 +92,19 @@ def test_scan_facts():
     out = stdout.getvalue()
     assert "scan" in out
     assert "OPENAI" in out
-    assert "Placeholder" in out
+    assert "1 keys" in out
+    assert "1 skipped" in out
+    assert "AUTH" not in out  # scan drops dead columns
+    assert "Unprobed" not in out
+
+
+def test_working_metric_is_dash_not_noise():
+    from keytruth import ProbeResult, display_metric
+    s = ProbeResult(
+        provider="OPENAI", auth="Valid", access="Working",
+        metric_type="NONE", metric_value="No balance authority",
+    )
+    assert display_metric(s) == "-"
 
 
 def test_json_output():

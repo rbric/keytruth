@@ -209,12 +209,17 @@ def probe_anthropic(key, is_financial=False):
         elif code == 400 and "credit balance too low" in body.lower():
             status.funding = "Depleted"
             status.access = "Restricted"
-        elif code == 400: 
-            status.access = "Unknown"
-            status.metric_value = "count_tokens error"
+        elif code == 400:
+            # /v1/models already proved the key. count_tokens glitch ≠ unknown access.
+            status.access = "Working"
+            status.metric_value = "No balance endpoint"
         elif code == 403:
             status.access = "Restricted"
-            
+        else:
+            status.access = "Working"
+
+    if status.auth == "Valid" and status.access == "Unknown":
+        status.access = "Working"
     if not status.metric_value:
         status.metric_value = "No balance endpoint"
     return status
@@ -677,6 +682,33 @@ def extract_keys(files, capture_unknown=False):
     return found_keys
 
 NON_CANDIDATE = {"Placeholder", "Empty", "Malformed"}
+# Metric strings that mean "probe worked, billing unknown" — not failures.
+METRIC_NOISE = {
+    "No balance authority",
+    "No balance endpoint",
+    "count_tokens error",
+    "Format OK",
+    "Valid Format",
+    "No billing authority",
+    "Balance unavailable",
+    "Balance unknown",
+    "No simple credit endpoint",
+    "Account confirmed",
+}
+
+def is_backup_path(path: str) -> bool:
+    name = Path(path).name.lower()
+    return (
+        name.endswith(".backup")
+        or name.endswith(".bak")
+        or name.endswith("~")
+        or ".backup." in name
+        or name.endswith(".old")
+    )
+
+def active_files(files) -> list:
+    """Files that count for reuse risk (.env.backup etc. excluded)."""
+    return [f for f in (files or []) if not is_backup_path(f)]
 
 def format_metric(status: ProbeResult) -> str:
     if status.metric_type == "BALANCE":
@@ -711,53 +743,105 @@ def format_metric(status: ProbeResult) -> str:
         return str(status.metric_value)
     return str(status.metric_value)
 
-def apply_reuse_risk(results_cache):
-    """Dumb rule: same candidate key in >1 file is CRITICAL. Placeholders don't count."""
-    for d in results_cache:
-        mv = d.get("status", {}).get("metric_value")
-        if mv in NON_CANDIDATE:
-            d["status"]["risk"] = "Low"
-        elif len(d.get("files", [])) > 1:
-            d["status"]["risk"] = f"Critical: reused in {len(d['files'])} files"
-        else:
-            d["status"]["risk"] = "Low"
+def display_metric(status: ProbeResult) -> str:
+    """Human metric: real numbers stay; 'working but no billing' becomes '-'."""
+    raw = format_metric(status)
+    if status.metric_value in NON_CANDIDATE:
+        return raw
+    if status.auth == "Invalid":
+        return raw if raw and raw != "None" else "Invalid Key"
+    if status.metric_type in {"BALANCE", "USAGE", "QUOTA", "ACCOUNT_BALANCE", "IDENTITY", "KEY_COUNT"}:
+        return raw
+    if status.access in {"Working", "Full", "Read", "Write"} and (
+        raw in METRIC_NOISE or status.metric_type == "NONE"
+    ):
+        return "-"
+    if status.auth == "Valid" and raw in METRIC_NOISE:
+        return "-"
+    if raw in METRIC_NOISE:
+        return "-"
+    return raw
 
-def risk_label(status: ProbeResult) -> str:
-    if status.risk.startswith("Critical"):
+def is_stripe_test(data) -> bool:
+    masked = data.get("masked_key") or ""
+    return data.get("provider") == "STRIPE" and masked.startswith("sk_test_")
+
+def compute_risk(data) -> str:
+    """Derive risk from files + key kind. Never trust cached status.risk."""
+    mv = (data.get("status") or {}).get("metric_value")
+    live = active_files(data.get("files", []))
+    if mv in NON_CANDIDATE or len(live) <= 1:
+        return "Low"
+    auth = (data.get("status") or {}).get("auth", "")
+    # Test Stripe / dead keys: inventory noise, not fire.
+    if is_stripe_test(data):
+        return f"Review: test key reused in {len(live)} files"
+    if auth == "Invalid":
+        return f"Review: dead key reused in {len(live)} files"
+    return f"Critical: reused in {len(live)} files"
+
+def risk_label(risk_or_status) -> str:
+    """Accept a risk string or ProbeResult (legacy). Prefer compute_risk(data)."""
+    if isinstance(risk_or_status, ProbeResult):
+        text = risk_or_status.risk
+    else:
+        text = risk_or_status or ""
+    if text.startswith("Critical"):
         return "CRITICAL"
+    if text.startswith("Review"):
+        return "REVIEW"
     return "NONE"
 
+def apply_reuse_risk(results_cache):
+    """Write derived risk into cache rows so disk matches reality."""
+    for d in results_cache:
+        d.setdefault("status", {})["risk"] = compute_risk(d)
+
 def row_sort_key(data):
+    """Live CRITICAL → dead/test REVIEW → Invalid → Restricted → Working → other."""
     status = ProbeResult(**data["status"])
-    risk = risk_label(status)
-    auth = status.auth
-    if risk == "CRITICAL":
-        return (0, data["provider"], data["hash"])
-    if auth == "Invalid":
-        return (1, data["provider"], data["hash"])
-    if status.access in ("Restricted", "Rate-limited") or status.auth in ("Unknown", "Detected"):
-        return (2, data["provider"], data["hash"])
-    if status.metric_value in NON_CANDIDATE:
-        return (4, data["provider"], data["hash"])
-    return (3, data["provider"], data["hash"])
+    label = risk_label(compute_risk(data))
+    if label == "CRITICAL":
+        tier = 0
+    elif label == "REVIEW":
+        tier = 1
+    elif status.auth == "Invalid":
+        tier = 2
+    elif status.access in ("Restricted", "Rate-limited"):
+        tier = 3
+    elif status.access in ("Working", "Full", "Read", "Write") or (
+        status.auth == "Valid" and status.access not in ("None",)
+    ):
+        tier = 4
+    elif status.auth == "Detected":
+        tier = 5
+    elif status.metric_value in NON_CANDIDATE:
+        tier = 7
+    else:
+        tier = 6
+    return (tier, data["provider"], data["hash"])
 
 def enrich_rows(results_cache, reused_only=False, show_placeholders=False):
     rows = [d for d in results_cache if d["provider"] != "UNKNOWN"]
     if reused_only:
-        rows = [d for d in rows if len(d.get("files", [])) > 1]
+        rows = [d for d in rows if len(active_files(d.get("files", []))) > 1]
     if not show_placeholders:
         rows = [
             d for d in rows
             if d.get("status", {}).get("metric_value") not in NON_CANDIDATE
         ]
+    # Always re-derive risk before sort/print.
+    apply_reuse_risk(rows)
     rows = sorted(rows, key=row_sort_key)
     for d in rows:
         status = ProbeResult(**d["status"])
-        d["_risk"] = risk_label(status)
-        d["_metric"] = format_metric(status)
+        d["_risk"] = risk_label(compute_risk(d))
+        d["_metric"] = display_metric(status)
         d["_auth"] = status.auth
         d["_access"] = status.access
+        # FILES column = all locations; risk uses active_files() (no backups).
         d["_nfiles"] = len(d.get("files", []))
+        d["_nactive"] = len(active_files(d.get("files", [])))
     return rows
 
 def print_json(results_cache, args=None):
@@ -774,6 +858,7 @@ def print_json(results_cache, args=None):
             "metric": d["_metric"],
             "risk": d["_risk"],
             "files": d.get("files", []),
+            "active_files": active_files(d.get("files", [])),
             "var_name": d.get("var_name", ""),
             "masked_key": d.get("masked_key", ""),
         })
@@ -785,10 +870,12 @@ def print_debug(results_cache):
         if d["provider"] == "UNKNOWN":
             continue
         status = ProbeResult(**d["status"])
+        live = active_files(d.get("files", []))
         print(f"=== {d['provider']} {d['hash'][:8]} ===")
         print(f"auth={status.auth} access={status.access} funding={status.funding}")
-        print(f"metric_type={status.metric_type} metric={format_metric(status)}")
-        print(f"risk={risk_label(status)} files={len(d.get('files', []))}")
+        derived = compute_risk(d)
+        print(f"metric_type={status.metric_type} metric={display_metric(status)} raw={format_metric(status)}")
+        print(f"risk={risk_label(derived)} ({derived}) active_files={len(live)} files={len(d.get('files', []))}")
         print(f"http_status={status.http_status}")
         if status.debug_logs:
             for line in status.debug_logs:
@@ -796,8 +883,16 @@ def print_debug(results_cache):
         else:
             print("  (no network trace — unscanned / not probed / placeholder)")
         for f in d.get("files", []):
-            print(f"  file: {f}")
+            tag = " (backup)" if is_backup_path(f) else ""
+            print(f"  file: {f}{tag}")
         print()
+
+def _color_risk(risk: str) -> str:
+    if risk == "CRITICAL":
+        return f"{RED}{risk}{RESET}"
+    if risk == "REVIEW":
+        return f"{YELLOW}{risk}{RESET}"
+    return risk
 
 def print_facts(results_cache, args=None, is_scan=False, files_count=0):
     reused_only = getattr(args, "reused", False) if args else False
@@ -808,25 +903,58 @@ def print_facts(results_cache, args=None, is_scan=False, files_count=0):
         print_json(results_cache, args=args)
         return
 
+    # Derive risk on the full known set so header counts match the table.
+    known = [d for d in results_cache if d["provider"] != "UNKNOWN"]
+    apply_reuse_risk(known)
+
     rows = enrich_rows(results_cache, reused_only=reused_only, show_placeholders=show_placeholders)
-    n_all = len([d for d in results_cache if d["provider"] != "UNKNOWN"])
-    n_crit = sum(1 for d in rows if d["_risk"] == "CRITICAL")
-    n_invalid = sum(1 for d in rows if d["_auth"] == "Invalid")
-    n_prov = len({d["provider"] for d in rows})
+    n_keys = sum(1 for d in known if d.get("status", {}).get("metric_value") not in NON_CANDIDATE)
+    n_skipped = sum(1 for d in known if d.get("status", {}).get("metric_value") in NON_CANDIDATE)
+    n_crit = sum(
+        1 for d in known
+        if risk_label(compute_risk(d)) == "CRITICAL"
+        and d.get("status", {}).get("metric_value") not in NON_CANDIDATE
+    )
+    n_review = sum(
+        1 for d in known
+        if risk_label(compute_risk(d)) == "REVIEW"
+        and d.get("status", {}).get("metric_value") not in NON_CANDIDATE
+    )
+    n_invalid = sum(1 for d in known if d.get("status", {}).get("auth") == "Invalid")
 
     mode = "scan" if is_scan else "probe"
-    print(f"keytruth 0.1.0  {mode}  files={files_count}  creds={len(rows)}/{n_all}  providers={n_prov}  critical={n_crit}  invalid={n_invalid}")
+    parts = [
+        f"keytruth 0.1.0  {mode}",
+        f"{files_count} files",
+        f"{n_keys} keys",
+        f"{n_skipped} skipped",
+        f"{n_crit} critical",
+        f"{n_review} review",
+    ]
+    if not is_scan:
+        parts.append(f"{n_invalid} invalid")
+    print(" · ".join(parts))
     if not rows:
         print("(empty)")
         return
 
-    # Fixed columns. Truncate metric. No boxes.
+    if is_scan:
+        hdr = f"{'PROVIDER':<12} {'KEY':<8} {'RISK':<8} {'FILES':>5}"
+        print(hdr)
+        print("-" * 40)
+        for d in rows:
+            risk = d["_risk"]
+            risk_s = _color_risk(risk)
+            risk_pad = 8 + (len(risk_s) - len(risk))
+            print(f"{d['provider']:<12} {d['hash'][:8]:<8} {risk_s:<{risk_pad}} {d['_nfiles']:>5}")
+        return
+
     hdr = f"{'PROVIDER':<12} {'KEY':<8} {'AUTH':<10} {'ACCESS':<12} {'RISK':<8} {'FILES':>5}  METRIC"
     print(hdr)
     print("-" * min(100, max(len(hdr), 72)))
     for d in rows:
         risk = d["_risk"]
-        risk_s = f"{RED}{risk}{RESET}" if risk == "CRITICAL" else risk
+        risk_s = _color_risk(risk)
         auth = d["_auth"]
         if auth == "Invalid":
             auth_s = f"{RED}{auth}{RESET}"
@@ -837,7 +965,6 @@ def print_facts(results_cache, args=None, is_scan=False, files_count=0):
         metric = d["_metric"]
         if len(metric) > 40:
             metric = metric[:39] + "…"
-        # pad colored fields by visible width
         auth_pad = 10 + (len(auth_s) - len(auth))
         risk_pad = 8 + (len(risk_s) - len(risk))
         print(
@@ -1100,10 +1227,16 @@ def run_show(args):
         
     data = matches[0]
     status = ProbeResult(**data['status'])
-    risk = risk_label(status)
+    derived = compute_risk(data)
+    risk = risk_label(derived)
 
+    live = active_files(data.get("files", []))
     if risk == "CRITICAL":
-        rec = "Stop sharing this key across files. Rotate after you split them."
+        rec = "Stop sharing this key across projects. Rotate after you split them."
+    elif risk == "REVIEW" and is_stripe_test(data):
+        rec = "Test key reused — fine for local, don't ship it."
+    elif risk == "REVIEW":
+        rec = "Dead key still copied around — delete the leftovers."
     elif status.auth == "Invalid":
         rec = "Delete or replace it."
     elif status.access in ("Restricted", "Rate-limited"):
@@ -1115,10 +1248,11 @@ def run_show(args):
 
     print(f"{data['provider']} {data['hash'][:8]}")
     print(f"auth={status.auth}  access={status.access}  risk={risk}")
-    print(f"metric={format_metric(status)}")
-    print("files:")
+    print(f"metric={display_metric(status)}")
+    print(f"files: {len(live)} active · {len(data.get('files', []))} total")
     for f in data['files']:
-        print(f"  {f}")
+        tag = " (backup)" if is_backup_path(f) else ""
+        print(f"  {f}{tag}")
     print(f"action: {rec}")
 if __name__ == "__main__":
     main()
